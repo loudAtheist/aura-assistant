@@ -1,0 +1,7 @@
+WORKDIR: /opt/aura-assistant
+USER: root (0)
+VENV: /opt/aura-assistant/venv
+TELEGRAM_TOKEN_SET: no
+OPENAI_API_KEY_SET: no
+OPENAI_MODEL: unset
+TEMP_DIR: unset

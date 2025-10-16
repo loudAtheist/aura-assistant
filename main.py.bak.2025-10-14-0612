@@ -1,0 +1,354 @@
+import os, json, re, logging
+from pathlib import Path
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import speech_recognition as sr
+from pydub import AudioSegment
+from openai import OpenAI
+
+from db import (
+    init_db, get_conn, get_all_lists, get_list_tasks, add_task, delete_list,
+    mark_task_done, delete_task, restore_task, find_list, fetch_task, fetch_list_by_task,
+    delete_task_fuzzy  # NEW
+)
+
+# ========= ENV =========
+dotenv_path = Path(__file__).resolve().parent / ".env"
+if dotenv_path.exists():
+    load_dotenv(dotenv_path)
+    print(f"[INFO] .env loaded from {dotenv_path}")
+else:
+    print(f"[WARNING] .env not found at {dotenv_path}")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+TEMP_DIR = os.getenv("TEMP_DIR", "/opt/aura-assistant/tmp")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# ========= LOG =========
+logging.basicConfig(
+    filename="/opt/aura-assistant/aura.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ========= DIALOG CONTEXT (per-user) =========
+SESSION: dict[int, dict] = {}   # { user_id: {"last_action": str, "last_list": str} }
+
+def set_ctx(user_id: int, **kw):
+    sess = SESSION.get(user_id, {})
+    sess.update({k:v for k,v in kw.items() if v})
+    SESSION[user_id] = sess
+
+def get_ctx(user_id: int, key: str, default=None):
+    return SESSION.get(user_id, {}).get(key, default)
+
+# ========= PROMPT (Semantic Core) =========
+SEMANTIC_PROMPT = """
+Ты — Aura, автономный ИИ-ассистент, соединённый с локальной базой данных сущностей (Entity System). Твоя основная функция — понимать смысл человеческих фраз и управлять этой базой, действуя как мыслящий помощник, а не как парсер.
+
+---
+🧠 Твоя роль:
+Ты — цифровой помощник, обладающий внутренним пониманием. Ты воспринимаешь речь пользователя как поток смыслов, не как набор команд. Перед каждым ответом ты анализируешь:
+1. Последние 5–10 сообщений (контекст разговора).
+2. Состояние базы (списки, задачи, заметки, напоминания).
+3. Намерение пользователя — что он *хочет достичь*, а не *что сказал буквально*.
+
+Ты не ищешь ключевые слова, ты рассуждаешь о цели запроса.
+
+---
+🗂 Управление базой:
+- Все данные — это сущности (entities) с типами list, task, note, reminder.
+- Ты можешь создавать, изменять, удалять, отмечать, искать и связывать эти сущности.
+- Если пользователь говорит неявно («добавь туда», «убери это»), ты используешь текущий контекст: active_list, active_task, недавние действия.
+- Если контекста недостаточно, ты возвращаешь clarify с уточняющим вопросом.
+
+---
+🧩 Твои принципы рассуждения:
+1. **Понимай цель, не слова.** Пользователь может сказать «я сделал» или «готово» — ты определяешь, что это завершение задачи.
+2. **Учитывай историю.** Если до этого говорили о списке «Покупки», то «добавь туда» относится к нему.
+3. **Действуй бережно.** Если запрос неоднозначен или потенциально разрушителен — уточни перед действием.
+4. **Не пиши объяснений пользователю.** Твоя задача — вернуть точный JSON, который описывает действие.
+5. **Сам выбирай действие.** На основе смысла решай, что это: создать, показать, обновить, удалить, завершить и т.д.
+6. **Мышление по аналогии.** Если ты не видишь прямого совпадения, подумай: что ближе по смыслу? (Например, «куплено» ~ «выполнено».)
+
+---
+📦 Формат ответа:
+{
+  "action": "create|add_task|show_lists|show_tasks|mark_done|delete_task|update_task|move_entity|convert_entity|search_entity|clarify|unknown",
+  "entity_type": "list|task|note|reminder",
+  "list": "<название>",
+  "task": "<содержание>",
+  "meta": {
+    "context_used": true,
+    "reasoning": true,
+    "context_trace": ["последние фразы"],
+    "confidence": 0.0-1.0,
+    "question": "<если нужно уточнение>"
+  }
+}
+
+---
+💬 Примеры мышления:
+- Пользователь: «Добавь туда хлеб» → анализируешь последние сообщения, видишь, что речь шла о списке «Покупки» → создаёшь add_task в нём.
+- Пользователь: «Картошка и молоко куплены» → анализируешь состояние задач, определяешь совпадения по смыслу и меняешь статус на done.
+- Пользователь: «Покажи всё» → выводишь все списки и их содержимое.
+- Пользователь: «Удалить вторую задачу» → смотришь список задач, индексируешь, выполняешь delete_task с meta.by_index=2.
+- Пользователь: «Удали это» без контекста → возвращаешь clarify.
+
+---
+⚙️ Поведение:
+- Если уверен — возвращай действие.
+- Если частично уверен — добавь поле confidence < 1.0 и уточняющий вопрос.
+- Если не уверен вовсе — верни clarify.
+
+---
+🎛️ Стиль мышления:
+- Аналитичный, контекстный, наблюдающий.
+- Принимаешь решения, исходя из цели пользователя, а не буквального текста.
+- Не шаблонный — ты свободен рассуждать, но обязан всегда выдавать формальный JSON.
+"""
+
+# ========= Helpers =========
+def extract_json_blocks(s: str):
+    try:
+        data = json.loads(s)
+        if isinstance(data, list): return data
+        if isinstance(data, dict): return [data]
+    except Exception:
+        pass
+    blocks = re.findall(r'\{[^{}]*\{[^{}]*\}[^{}]*\}|\{[^{}]+\}', s, re.DOTALL)
+    if not blocks:
+        blocks = re.findall(r'\{[^{}]+\}', s, re.DOTALL)
+    out = []
+    for b in blocks:
+        try:
+            out.append(json.loads(b))
+        except Exception:
+            logging.warning(f"Skip invalid JSON block: {b[:120]}")
+    return out
+
+def wants_expand(text: str) -> bool:
+    return bool(re.search(r'\b(все|всё|разверну|подробн)\w*', (text or "").lower()))
+
+def text_mentions_list_and_name(text: str):
+    m = re.search(r'(?:список|лист)\s+([^\n\r]+)$', (text or "").strip(), re.IGNORECASE)
+    if m:
+        name = m.group(1).strip(" .!?:;«»'\"").strip()
+        return name
+    return None
+
+async def expand_all_lists(update: Update, conn, user_id: int):
+    lists = get_all_lists(conn, user_id)
+    if not lists:
+        await update.message.reply_text("Пока нет списков 🕊")
+        return
+    await update.message.reply_text("🗂 Твои списки:\n" + "\n".join([f"📋 {n}" for n in lists]))
+    for n in lists:
+        items = get_list_tasks(conn, user_id, n)
+        if items:
+            txt = "\n".join([f"• {t}" for t in items])
+        else:
+            txt = "— пусто —"
+        await update.message.reply_text(f"📋 {n}:\n{txt}")
+    set_ctx(user_id, last_action="show_lists")
+
+async def route_actions(update: Update, actions: list, user_id: int, original_text: str):
+    conn = get_conn()
+    for obj in actions:
+        action = obj.get("action", "unknown")
+        entity_type = obj.get("entity_type")
+        list_name = obj.get("list") or get_ctx(user_id, "last_list")
+        task = obj.get("task") or obj.get("title")
+
+        # CONTEXT FALLBACKS
+        if action in ("unknown", None):
+            # Пост-команда вида "в развернутом виде"
+            if wants_expand(original_text) and get_ctx(user_id, "last_action") == "show_lists":
+                await expand_all_lists(update, conn, user_id)
+                continue
+
+            # "разверни список <имя>" / "выведи список <имя>"
+            name_from_text = text_mentions_list_and_name(original_text)
+            if name_from_text:
+                list_name = name_from_text
+                action = "show_tasks"
+
+        # ROUTING
+        if action == "create" and entity_type == "list" and obj.get("list"):
+            try:
+                from db import create_list
+                create_list(conn, user_id, obj["list"])
+                await update.message.reply_text(f"🆕 Создан список *{obj['list']}*", parse_mode="Markdown")
+                set_ctx(user_id, last_action="create_list", last_list=obj["list"])
+            except Exception as e:
+                logging.exception(f"Create list error: {e}")
+                await update.message.reply_text("⚠️ Не удалось создать список.")
+
+        elif action == "add_task" and list_name and task:
+            try:
+                add_task(conn, user_id, list_name, task)
+                await update.message.reply_text(f"✅ Добавлено: *{task}* в список *{list_name}*", parse_mode="Markdown")
+                set_ctx(user_id, last_action="add_task", last_list=list_name)
+            except Exception as e:
+                logging.exception(f"Add task error: {e}")
+                await update.message.reply_text("⚠️ Не удалось добавить задачу.")
+
+        elif action == "show_lists":
+            try:
+                if wants_expand(original_text) or (obj.get("meta") or {}).get("expand"):
+                    await expand_all_lists(update, conn, user_id)
+                else:
+                    lists = get_all_lists(conn, user_id)
+                    if lists:
+                        txt = "\n".join([f"📋 {n}" for n in lists])
+                        await update.message.reply_text(f"🗂 Твои списки:\n{txt}")
+                    else:
+                        await update.message.reply_text("Пока нет списков 🕊")
+                set_ctx(user_id, last_action="show_lists")
+            except Exception as e:
+                logging.exception(f"Show lists error: {e}")
+                await update.message.reply_text("⚠️ Не удалось получить списки.")
+
+        elif action == "show_tasks" and list_name:
+            try:
+                items = get_list_tasks(conn, user_id, list_name)
+                if items:
+                    txt = "\n".join([f"• {t}" for t in items])
+                    await update.message.reply_text(f"📋 *{list_name}:*\n{txt}", parse_mode="Markdown")
+                else:
+                    await update.message.reply_text(f"Список *{list_name}* пуст.", parse_mode="Markdown")
+                set_ctx(user_id, last_action="show_tasks", last_list=list_name)
+            except Exception as e:
+                logging.exception(f"Show tasks error: {e}")
+                await update.message.reply_text("⚠️ Не удалось получить задачи.")
+
+        elif action == "delete_task":
+            try:
+                # Если нет явного названия задачи — попробуем по тексту (нечётко) и/или по последнему списку
+                q = (task or original_text or "").strip()
+                ln = list_name or get_ctx(user_id, "last_list")
+                if not ln:
+                    await update.message.reply_text("Уточни, из какого списка удалить.")
+                    continue
+                deleted, matched = delete_task_fuzzy(conn, user_id, ln, q)
+                if deleted:
+                    await update.message.reply_text(f"🗑 Удалено: *{matched}* из *{ln}*", parse_mode="Markdown")
+                else:
+                    await update.message.reply_text("Нечего удалять.")
+                set_ctx(user_id, last_action="delete_task", last_list=ln)
+            except Exception as e:
+                logging.exception(f"Delete task error: {e}")
+                await update.message.reply_text("⚠️ Не удалось удалить задачу.")
+
+        elif action == "mark_done" and list_name and task:
+            try:
+                n = mark_task_done(conn, user_id, list_name, task)
+                await update.message.reply_text("✔️ Готово." if n else "Не нашёл такую задачу.")
+                set_ctx(user_id, last_action="mark_done", last_list=list_name)
+            except Exception as e:
+                logging.exception(f"Mark done error: {e}")
+                await update.message.reply_text("⚠️ Не удалось отметить задачу.")
+
+        else:
+            # Последняя попытка: «разверни»/«покажи список <имя>» из текста
+            if wants_expand(original_text) and get_ctx(user_id, "last_action") == "show_lists":
+                await expand_all_lists(update, conn, user_id)
+            else:
+                name_from_text = text_mentions_list_and_name(original_text)
+                if name_from_text:
+                    items = get_list_tasks(conn, user_id, name_from_text)
+                    if items:
+                        txt = "\n".join([f"• {t}" for t in items])
+                        await update.message.reply_text(f"📋 *{name_from_text}:*\n{txt}", parse_mode="Markdown")
+                        set_ctx(user_id, last_action="show_tasks", last_list=name_from_text)
+                        continue
+                await update.message.reply_text("🤔 Не понял, что нужно сделать.")
+
+# ========= Handlers =========
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_text: str | None = None):
+    user_id = update.effective_user.id
+    text = (input_text or update.message.text or "").strip()
+    logging.info(f"📩 Text from {user_id}: {text}")
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": SEMANTIC_PROMPT},
+                {"role": "user", "content": text}
+            ],
+        )
+        raw = resp.choices[0].message.content.strip()
+        logging.info(f"🤖 RAW: {raw}")
+        try:
+            with open("/opt/aura-assistant/openai_raw.log", "a", encoding="utf-8") as f:
+                f.write(f"\n=== RAW ({user_id}) ===\n{text}\n{raw}\n")
+        except Exception:
+            pass
+
+        actions = extract_json_blocks(raw)
+        if not actions:
+            # Контекстные короткие фразы («в развернутом виде», «разверни»)
+            if wants_expand(text) and get_ctx(user_id, "last_action") == "show_lists":
+                conn = get_conn()
+                await expand_all_lists(update, conn, user_id)
+                return
+            await update.message.reply_text("⚠️ Модель ответила не в JSON-формате.")
+            return
+
+        await route_actions(update, actions, user_id, text)
+
+    except Exception as e:
+        logging.exception(f"❌ handle_text error: {e}")
+        await update.message.reply_text("Произошла ошибка при обработке. Проверь логи.")
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    logging.info(f"🎙 Voice from {user_id}")
+    try:
+        vf = await update.message.voice.get_file()
+        ogg = os.path.join(TEMP_DIR, f"{user_id}_voice.ogg")
+        wav = os.path.join(TEMP_DIR, f"{user_id}_voice.wav")
+        await vf.download_to_drive(ogg)
+        AudioSegment.from_ogg(ogg).export(wav, format="wav")
+
+        r = sr.Recognizer()
+        with sr.AudioFile(wav) as src:
+            audio = r.record(src)
+            text = r.recognize_google(audio, language="ru-RU")
+
+        logging.info(f"🗣 ASR: {text}")
+        await update.message.reply_text(f"🗣 {text}")
+
+        await handle_text(update, context, input_text=text)
+
+        try:
+            os.remove(ogg); os.remove(wav)
+        except Exception:
+            pass
+
+    except Exception as e:
+        logging.exception(f"❌ voice error: {e}")
+        await update.message.reply_text("⚠️ Не удалось обработать голос. Проверь логи.")
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("🌀 Обработка...")
+
+def main():
+    init_db()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    logging.info("🚀 Aura v6.6 started.")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()

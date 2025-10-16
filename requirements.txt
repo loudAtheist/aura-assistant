@@ -1,0 +1,6 @@
+python-telegram-bot
+speechrecognition
+pydub
+openai>=1.0.0
+httpx
+ffmpeg-python

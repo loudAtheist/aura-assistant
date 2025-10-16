@@ -1,0 +1,202 @@
+import sqlite3, json, os
+
+DB_PATH = "/opt/aura-assistant/db.sqlite3"
+
+ENTITIES_DDL = """
+CREATE TABLE IF NOT EXISTS entities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  type TEXT NOT NULL,             -- 'list', 'task', 'note', 'reminder', ...
+  title TEXT,
+  content TEXT,
+  parent_id INTEGER,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  meta TEXT,
+  UNIQUE(user_id, type, title, parent_id)
+);
+"""
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_conn()
+    with conn:
+        conn.execute(ENTITIES_DDL)
+    conn.close()
+
+# ---------- Entity Layer ----------
+def _get_or_create_list(conn, user_id, list_name):
+    cur = conn.cursor()
+    cur.execute("""SELECT id FROM entities
+                   WHERE user_id=? AND type='list' AND title=? LIMIT 1""",
+                (user_id, list_name))
+    row = cur.fetchone()
+    if row:
+        return row[0]
+    cur.execute("""INSERT INTO entities (user_id, type, title)
+                   VALUES (?, 'list', ?)""",
+                (user_id, list_name))
+    return cur.lastrowid
+
+def create_list(conn, user_id, list_name):
+    _get_or_create_list(conn, user_id, list_name)
+
+def find_list(conn, user_id, list_name):
+    cur = conn.cursor()
+    cur.execute("""SELECT id, title FROM entities
+                   WHERE user_id=? AND type='list' AND title=? LIMIT 1""",
+                (user_id, list_name))
+    return cur.fetchone()
+
+def get_all_lists(conn, user_id):
+    cur = conn.cursor()
+    cur.execute("""SELECT title FROM entities
+                   WHERE user_id=? AND type='list'
+                   ORDER BY created_at ASC""",
+                (user_id,))
+    return [row["title"] for row in cur.fetchall()]
+
+def add_task(conn, user_id, list_name, task_title):
+    list_id = _get_or_create_list(conn, user_id, list_name)
+    cur = conn.cursor()
+    cur.execute("""INSERT OR IGNORE INTO entities
+                   (user_id, type, title, parent_id, meta)
+                   VALUES (?, 'task', ?, ?, ?)""",
+                (user_id, task_title, list_id, json.dumps({"status": "open"})))
+    return cur.lastrowid
+
+def get_list_tasks(conn, user_id, list_name):
+    cur = conn.cursor()
+    cur.execute("""SELECT id FROM entities
+                   WHERE user_id=? AND type='list' AND title=? LIMIT 1""",
+                (user_id, list_name))
+    row = cur.fetchone()
+    if not row:
+        return []
+    list_id = row["id"]
+    cur.execute("""SELECT title FROM entities
+                   WHERE user_id=? AND type='task' AND parent_id=?
+                   ORDER BY created_at ASC""",
+                (user_id, list_id))
+    return [r["title"] for r in cur.fetchall()]
+
+def mark_task_done(conn, user_id, list_name, task_title):
+    cur = conn.cursor()
+    # найдём list_id
+    cur.execute("""SELECT id FROM entities
+                   WHERE user_id=? AND type='list' AND title=? LIMIT 1""",
+                (user_id, list_name))
+    row = cur.fetchone()
+    if not row:
+        return 0
+    list_id = row["id"]
+    # апдейт meta.status = done
+    cur.execute("""SELECT id, meta FROM entities
+                   WHERE user_id=? AND type='task' AND parent_id=? AND title=? LIMIT 1""",
+                (user_id, list_id, task_title))
+    task = cur.fetchone()
+    if not task:
+        return 0
+    meta = {}
+    if task["meta"]:
+        try: meta = json.loads(task["meta"])
+        except: meta = {}
+    meta["status"] = "done"
+    cur.execute("""UPDATE entities SET meta=? WHERE id=?""",
+                (json.dumps(meta, ensure_ascii=False), task["id"]))
+    return cur.rowcount
+
+# совместимость со старым API (заглушки)
+def delete_list(conn, user_id, list_name):
+    cur = conn.cursor()
+    # мягкое удаление: meta.deleted = true у списка и задач
+    cur.execute("""SELECT id, meta FROM entities
+                   WHERE user_id=? AND type='list' AND title=? LIMIT 1""",
+                (user_id, list_name))
+    row = cur.fetchone()
+    if not row:
+        return 0
+    list_id, meta = row["id"], row["meta"]
+    try: meta = json.loads(meta) if meta else {}
+    except: meta = {}
+    meta["deleted"] = True
+    cur.execute("UPDATE entities SET meta=? WHERE id=?",
+                (json.dumps(meta, ensure_ascii=False), list_id))
+    # children
+    cur.execute("""SELECT id, meta FROM entities
+                   WHERE user_id=? AND type='task' AND parent_id=?""",
+                (user_id, list_id))
+    for r in cur.fetchall():
+        m = {}
+        try: m = json.loads(r["meta"]) if r["meta"] else {}
+        except: m = {}
+        m["deleted"] = True
+        cur.execute("UPDATE entities SET meta=? WHERE id=?", (json.dumps(m, ensure_ascii=False), r["id"]))
+    return 1
+
+def delete_task(conn, user_id, list_name, task_title):
+    cur = conn.cursor()
+    cur.execute("""SELECT id FROM entities
+                   WHERE user_id=? AND type='list' AND title=? LIMIT 1""",
+                (user_id, list_name))
+    row = cur.fetchone()
+    if not row:
+        return 0
+    list_id = row["id"]
+    cur.execute("""SELECT id, meta FROM entities
+                   WHERE user_id=? AND type='task' AND parent_id=? AND title=? LIMIT 1""",
+                (user_id, list_id, task_title))
+    t = cur.fetchone()
+    if not t:
+        return 0
+    meta = {}
+    try: meta = json.loads(t["meta"]) if t["meta"] else {}
+    except: meta = {}
+    meta["deleted"] = True
+    cur.execute("UPDATE entities SET meta=? WHERE id=?", (json.dumps(meta, ensure_ascii=False), t["id"]))
+    return 1
+
+def restore_task(conn, user_id, list_name, task_title):
+    cur = conn.cursor()
+    cur.execute("""SELECT id FROM entities
+                   WHERE user_id=? AND type='list' AND title=? LIMIT 1""",
+                (user_id, list_name))
+    row = cur.fetchone()
+    if not row:
+        return 0
+    list_id = row["id"]
+    cur.execute("""SELECT id, meta FROM entities
+                   WHERE user_id=? AND type='task' AND parent_id=? AND title=? LIMIT 1""",
+                (user_id, list_id, task_title))
+    t = cur.fetchone()
+    if not t:
+        return 0
+    meta = {}
+    try: meta = json.loads(t["meta"]) if t["meta"] else {}
+    except: meta = {}
+    meta["deleted"] = False
+    cur.execute("UPDATE entities SET meta=? WHERE id=?", (json.dumps(meta, ensure_ascii=False), t["id"]))
+    return 1
+
+def fetch_task(conn, user_id, list_name, task_title):
+    cur = conn.cursor()
+    cur.execute("""SELECT e.id, e.title, e.meta FROM entities e
+                   JOIN entities l ON l.id = e.parent_id
+                   WHERE e.user_id=? AND e.type='task' AND l.type='list' AND l.title=? AND e.title=?
+                   LIMIT 1""",
+                (user_id, list_name, task_title))
+    return cur.fetchone()
+
+def fetch_list_by_task(conn, user_id, task_title):
+    cur = conn.cursor()
+    cur.execute("""SELECT l.title AS list_title, e.title AS task_title
+                   FROM entities e
+                   JOIN entities l ON l.id = e.parent_id
+                   WHERE e.user_id=? AND e.type='task' AND e.title=?
+                   LIMIT 1""",
+                (user_id, task_title))
+    return cur.fetchone()
+

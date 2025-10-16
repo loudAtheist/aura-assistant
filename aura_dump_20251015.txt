@@ -1,0 +1,175 @@
+import sqlite3, json, os, sys
+
+DB_PATH = "/opt/aura-assistant/db.sqlite3"
+
+DDL = """
+CREATE TABLE IF NOT EXISTS entities (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  type TEXT NOT NULL,             -- 'list', 'task', 'note', 'reminder', ...
+  title TEXT,                     -- человекочитаемое имя/название
+  content TEXT,                   -- свободный текст/описание
+  parent_id INTEGER,              -- ссылка на родителя (например, task->list)
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  meta TEXT,                      -- JSON-поле для гибких свойств
+  UNIQUE(user_id, type, title, parent_id)
+);
+"""
+
+def table_exists(conn, name):
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
+    return cur.fetchone() is not None
+
+def migrate_lists_tasks(conn):
+    cur = conn.cursor()
+
+    # Если старых таблиц нет — просто выходим
+    if not table_exists(conn, "lists") and not table_exists(conn, "tasks"):
+        return
+
+    # Подгружаем ВСЕ списки (если таблица есть)
+    lists = []
+    if table_exists(conn, "lists"):
+        cur.execute("PRAGMA table_info(lists)")
+        cols = [c[1] for c in cur.fetchall()]
+        # ожидаем минимум: user_id, name
+        if set(["user_id","name"]).issubset(set(cols)):
+            cur.execute("SELECT DISTINCT user_id, name FROM lists")
+            lists = cur.fetchall()
+
+    # Подготовим индекс имён списков -> id entity
+    list_id_by_key = {}  # (user_id, name) -> entity_id
+
+    # Создадим записи-списки в entities (idempotent)
+    for user_id, name in lists:
+        try:
+            cur.execute("""
+              INSERT OR IGNORE INTO entities (user_id, type, title)
+              VALUES (?, 'list', ?)
+            """, (user_id, name))
+            conn.commit()
+        except Exception:
+            pass
+        cur.execute("""
+          SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1
+        """, (user_id, name))
+        row = cur.fetchone()
+        if row:
+            list_id_by_key[(user_id, name)] = row[0]
+
+    # Теперь задачи
+    if table_exists(conn, "tasks"):
+        cur.execute("PRAGMA table_info(tasks)")
+        cols = [c[1] for c in cur.fetchall()]
+        # ожидаем минимум: user_id, list_name, task
+        if set(["user_id","list_name","task"]).issubset(set(cols)):
+            cur.execute("SELECT user_id, list_name, task FROM tasks")
+            for user_id, list_name, task in cur.fetchall():
+                # убедимся, что есть list entity
+                if (user_id, list_name) not in list_id_by_key:
+                    # создадим список, если вдруг не было
+                    cur.execute("""
+                      INSERT OR IGNORE INTO entities (user_id, type, title)
+                      VALUES (?, 'list', ?)
+                    """, (user_id, list_name))
+                    conn.commit()
+                    cur.execute("""
+                      SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1
+                    """, (user_id, list_name))
+                    r2 = cur.fetchone()
+                    if r2: list_id_by_key[(user_id, list_name)] = r2[0]
+
+                parent_id = list_id_by_key.get((user_id, list_name))
+                # добавим task
+                cur.execute("""
+                  INSERT OR IGNORE INTO entities (user_id, type, title, parent_id, meta)
+                  VALUES (?, 'task', ?, ?, ?)
+                """, (user_id, task, parent_id, json.dumps({"status": "open"})))
+            conn.commit()
+
+def main():
+    if not os.path.exists(DB_PATH):
+        print(f"DB not found: {DB_PATH}", file=sys.stderr)
+        sys.exit(1)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        with conn:
+            conn.execute(DDL)
+            migrate_lists_tasks(conn)
+        print("Migration to entities: OK")
+    finally:
+        conn.close()
+
+if __name__ == "__main__":
+    main()
+#!/bin/bash
+# === Старт Aura Assistant (фоновый режим + логирование) ===
+
+cd /opt/aura-assistant || exit 1
+
+# Активируем виртуальное окружение
+source venv/bin/activate
+
+# Запускаем бота
+python main.py >> /opt/aura-assistant/aura.log 2>&1 &
+#!/bin/bash
+# Остановка Aura Assistant
+pkill -f "/opt/aura-assistant/main.py"
+echo "🛑 Aura Assistant остановлен"
+python-telegram-bot
+speechrecognition
+pydub
+openai>=1.0.0
+httpx
+ffmpeg-python
+#!/usr/bin/env bash
+set -euo pipefail
+TS=$(date +"%Y%m%d_%H%M%S")
+OUT="/opt/aura-assistant/aura_support_$TS"
+mkdir -p "$OUT"
+
+# Ключевые файлы проекта (копируем, если существуют)
+for f in main.py db.py requirements.txt start.sh stop.sh docker-compose.yml pyproject.toml poetry.lock; do
+  [ -f "$f" ] && cp -v "$f" "$OUT/" || true
+done
+
+# Логи (берём хвосты, чтобы не тянуть гигабайты)
+for f in aura.log aura.run.log openai_raw.log; do
+  [ -f "$f" ] && tail -n 400 "$f" > "$OUT/${f}.tail.txt" || true
+done
+
+# systemd unit (если есть)
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl list-unit-files 2>/dev/null | grep -q '^aura-assistant\.service' && \
+    systemctl cat aura-assistant.service > "$OUT/aura-assistant.service.txt" || true
+fi
+
+# .env (с маскировкой значений)
+if [ -f .env ]; then
+  sed -E 's/^([A-Za-z0-9_]+)=.*/\1=***REDACTED*** /' .env > "$OUT/.env.redacted"
+fi
+
+# Версии инструментов/зависимостей
+python -V > "$OUT/python_version.txt" 2>&1 || true
+pip freeze > "$OUT/pip_freeze.txt" 2>/dev/null || true
+ffmpeg -version > "$OUT/ffmpeg_version.txt" 2>/dev/null || true
+
+# Быстрый снимок окружения
+cat > "$OUT/runtime_check.txt" <<RUNTIME
+WORKDIR: $(pwd)
+USER: $(id -u -n) ($(id -u))
+VENV: ${VIRTUAL_ENV:-none}
+TELEGRAM_TOKEN_SET: $( [ -n "${TELEGRAM_TOKEN:-}" ] && echo yes || echo no )
+OPENAI_API_KEY_SET: $( [ -n "${OPENAI_API_KEY:-}" ] && echo yes || echo no )
+OPENAI_MODEL: ${OPENAI_MODEL:-unset}
+TEMP_DIR: ${TEMP_DIR:-unset}
+RUNTIME
+
+# Полезные grep по main.py (для быстрой навигации)
+[ -f main.py ] && grep -nE "ApplicationBuilder|MessageHandler|filters\.VOICE|run_polling" main.py > "$OUT/main_handlers_grep.txt" || true
+
+# Упаковка
+tar -czf "$OUT.tgz" -C "$(dirname "$OUT")" "$(basename "$OUT")"
+echo "Bundle created: $OUT.tgz"
+ls -lh "$OUT.tgz"

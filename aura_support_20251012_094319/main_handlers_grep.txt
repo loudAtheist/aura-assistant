@@ -1,0 +1,5 @@
+7:    ApplicationBuilder, MessageHandler, CallbackQueryHandler,
+153:    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+155:    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+156:    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+160:    app.run_polling()
