@@ -6,7 +6,6 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandle
 import speech_recognition as sr
 from pydub import AudioSegment
 from openai import OpenAI
-from datetime import datetime, timedelta
 from db import (
     rename_list, normalize_text, init_db, get_conn, get_all_lists, get_list_tasks, add_task, delete_list,
     mark_task_done, mark_task_done_fuzzy, delete_task, restore_task, find_list, fetch_task, fetch_list_by_task,
@@ -25,17 +24,25 @@ else:
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-TEMP_DIR = os.getenv("TEMP_DIR", "/opt/aura-assistant/tmp")
-os.makedirs(TEMP_DIR, exist_ok=True)
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("AURA_DATA_DIR") or BASE_DIR).expanduser().resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR = Path(os.getenv("TEMP_DIR") or (DATA_DIR / "tmp")).expanduser().resolve()
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+LOG_PATH = Path(os.getenv("AURA_LOG_PATH") or (DATA_DIR / "aura.log")).expanduser().resolve()
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+OPENAI_LOG_PATH = Path(os.getenv("OPENAI_LOG_PATH") or (DATA_DIR / "openai_raw.log")).expanduser().resolve()
+OPENAI_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # ========= LOG =========
 logging.basicConfig(
-    filename="/opt/aura-assistant/aura.log",
+    filename=str(LOG_PATH),
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client: OpenAI | None = None
 
 # ========= DIALOG CONTEXT (per-user) =========
 SESSION: dict[int, dict] = {}  # { user_id: {"last_action": str, "last_list": str, "history": [str], "pending_delete": str} }
@@ -552,6 +559,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
     text = (input_text or update.message.text or "").strip()
     logging.info(f"📩 Text from {user_id}: {text}")
     try:
+        if client is None:
+            logging.error("OpenAI client is not configured")
+            await update.message.reply_text("⚠️ Конфигурация OpenAI не настроена.")
+            await send_menu(update, context)
+            return
         conn = get_conn()
         db_state = {
             "lists": {n: [t for _, t in get_list_tasks(conn, user_id, n)] for n in get_all_lists(conn, user_id)},
@@ -575,7 +587,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
         raw = resp.choices[0].message.content.strip()
         logging.info(f"🤖 RAW: {raw}")
         try:
-            with open("/opt/aura-assistant/openai_raw.log", "a", encoding="utf-8") as f:
+            with OPENAI_LOG_PATH.open("a", encoding="utf-8") as f:
                 f.write(f"\n=== RAW ({user_id}) ===\n{text}\n{raw}\n")
         except Exception:
             logging.warning("Failed to write to openai_raw.log")
@@ -601,12 +613,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"🎙 Voice from {user_id}")
     try:
         vf = await update.message.voice.get_file()
-        ogg = os.path.join(TEMP_DIR, f"{user_id}_voice.ogg")
-        wav = os.path.join(TEMP_DIR, f"{user_id}_voice.wav")
-        await vf.download_to_drive(ogg)
-        AudioSegment.from_ogg(ogg).export(wav, format="wav")
+        ogg = TEMP_DIR / f"{user_id}_voice.ogg"
+        wav = TEMP_DIR / f"{user_id}_voice.wav"
+        await vf.download_to_drive(str(ogg))
+        AudioSegment.from_ogg(str(ogg)).export(str(wav), format="wav")
         r = sr.Recognizer()
-        with sr.AudioFile(wav) as src:
+        with sr.AudioFile(str(wav)) as src:
             audio = r.record(src)
             text = r.recognize_google(audio, language="ru-RU")
             text = normalize_text(text)
@@ -614,7 +626,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🗣 {text}")
         await handle_text(update, context, input_text=text)
         try:
-            os.remove(ogg); os.remove(wav)
+            if ogg.exists():
+                ogg.unlink()
+            if wav.exists():
+                wav.unlink()
         except Exception:
             pass
     except Exception as e:
@@ -660,6 +675,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Ошибка обработки. Проверь логи.")
 
 def main():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN is not set. Укажи токен бота в переменной окружения TELEGRAM_TOKEN.")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set. Укажи ключ OpenAI в переменной окружения OPENAI_API_KEY.")
+    global client
+    client = OpenAI(api_key=OPENAI_API_KEY)
     init_db()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

@@ -1,8 +1,10 @@
 import sqlite3, json, os, re
+from pathlib import Path
 from Levenshtein import distance
 import logging
 
-DB_PATH = "/opt/aura-assistant/db.sqlite3"
+DATA_DIR = Path(os.getenv("AURA_DATA_DIR", Path(__file__).resolve().parent))
+DB_PATH = Path(os.getenv("DB_PATH", DATA_DIR / "db.sqlite3")).resolve()
 
 ENTITIES_DDL = """
 CREATE TABLE IF NOT EXISTS entities (
@@ -19,7 +21,8 @@ CREATE TABLE IF NOT EXISTS entities (
 """
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.isolation_level = None
     return conn
@@ -600,7 +603,7 @@ def update_entity(conn, user_id: int, entity_type: str, title: str, new_title: s
             params.append(json.dumps(meta))
     if not updates:
         return None
-    sql = f"UPDATE entities SET {", ".join(updates)} WHERE user_id=? AND type=? AND title=?"
+    sql = f"UPDATE entities SET {', '.join(updates)} WHERE user_id=? AND type=? AND title=?"
     params.extend([user_id, entity_type, title])
     cur.execute(sql, params)
     conn.commit()
