@@ -142,8 +142,8 @@ def extract_json_blocks(s: str):
     try:
         data = json.loads(s)
         if isinstance(data, list):
-            logging.info(f"Extracted JSON list: {data[0]}")
-            return [data[0]]  # Take first JSON to avoid duplicates
+            logging.info(f"Extracted JSON list: {data}")
+            return data
         if isinstance(data, dict):
             logging.info(f"Extracted JSON dict: {data}")
             return [data]
@@ -160,7 +160,7 @@ def extract_json_blocks(s: str):
             out.append(parsed)
         except Exception:
             logging.warning(f"Skip invalid JSON block: {b[:120]}")
-    return out[:1]  # Limit to one action to avoid duplicates
+    return out
 
 def wants_expand(text: str) -> bool:
     return bool(re.search(r'\b(разверну|подробн)\w*', (text or "").lower()))
@@ -176,6 +176,13 @@ def extract_tasks_from_question(question: str) -> list[str]:
     if not question:
         return []
     return [m.strip() for m in re.findall(r"'([^']+)'", question)]
+
+def split_user_commands(text: str) -> list[str]:
+    if not text:
+        return []
+    normalized = text.replace("\r", "\n")
+    parts = re.split(r'(?:[.,;]+|\n+|\bи\b)', normalized, flags=re.IGNORECASE)
+    return [p.strip() for p in parts if p and p.strip()]
 
 def map_tasks_to_lists(conn, user_id: int, task_titles: list[str]) -> dict[str, str]:
     mapping: dict[str, str] = {}
@@ -672,74 +679,83 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
     logging.info(f"📩 Text from {user_id}: {text}")
     try:
         conn = get_conn()
-        history = get_ctx(user_id, "history", [])
-        text_lower = text.lower()
-        pending_delete = get_ctx(user_id, "pending_delete")
-        pending_confirmation = get_ctx(user_id, "pending_confirmation")
-        if text_lower in ["да", "yes", "нет", "no"] and (pending_delete or pending_confirmation):
-            if text_lower in ["да", "yes"]:
-                if pending_delete:
-                    try:
-                        logging.info(f"Deleting list via pending_delete: {pending_delete}")
-                        deleted = delete_list(conn, user_id, pending_delete)
-                        if deleted:
-                            await update.message.reply_text(f"🗑 Список *{pending_delete}* удалён.", parse_mode="Markdown")
-                            set_ctx(user_id, pending_delete=None, pending_confirmation=None, last_list=None)
-                        else:
-                            await update.message.reply_text(f"⚠️ Список *{pending_delete}* не найден.")
+        commands = split_user_commands(text)
+        if not commands:
+            commands = [text]
+        for part in commands:
+            command_text = part.strip()
+            if not command_text:
+                continue
+            history = get_ctx(user_id, "history", [])
+            lower_command = command_text.lower()
+            pending_delete = get_ctx(user_id, "pending_delete")
+            pending_confirmation = get_ctx(user_id, "pending_confirmation")
+            if lower_command in ["да", "yes", "нет", "no"] and (pending_delete or pending_confirmation):
+                if lower_command in ["да", "yes"]:
+                    if pending_delete:
+                        try:
+                            logging.info(f"Deleting list via pending_delete: {pending_delete}")
+                            deleted = delete_list(conn, user_id, pending_delete)
+                            if deleted:
+                                await update.message.reply_text(f"🗑 Список *{pending_delete}* удалён.", parse_mode="Markdown")
+                                set_ctx(user_id, pending_delete=None, pending_confirmation=None, last_list=None)
+                            else:
+                                await update.message.reply_text(f"⚠️ Список *{pending_delete}* не найден.")
+                                set_ctx(user_id, pending_delete=None)
+                        except Exception as e:
+                            logging.exception(f"Delete list error during confirmation: {e}")
+                            await update.message.reply_text("⚠️ Ошибка удаления.")
                             set_ctx(user_id, pending_delete=None)
-                    except Exception as e:
-                        logging.exception(f"Delete list error during confirmation: {e}")
-                        await update.message.reply_text("⚠️ Ошибка удаления.")
+                    elif pending_confirmation:
+                        await handle_pending_confirmation(update.message, context, conn, user_id, pending_confirmation)
+                else:
+                    if pending_delete:
+                        await update.message.reply_text("Хорошо, отмена удаления.")
                         set_ctx(user_id, pending_delete=None)
-                elif pending_confirmation:
-                    await handle_pending_confirmation(update.message, context, conn, user_id, pending_confirmation)
-            else:
-                if pending_delete:
-                    await update.message.reply_text("Хорошо, отмена удаления.")
-                    set_ctx(user_id, pending_delete=None)
-                if pending_confirmation:
-                    await update.message.reply_text("Хорошо, отмена.")
-                    set_ctx(user_id, pending_confirmation=None)
-            set_ctx(user_id, history=history + [text])
-            return
-        db_state = {
-            "lists": {n: [t for _, t in get_list_tasks(conn, user_id, n)] for n in get_all_lists(conn, user_id)},
-            "last_list": get_ctx(user_id, "last_list"),
-            "pending_delete": get_ctx(user_id, "pending_delete")
-        }
-        user_profile = get_user_profile(conn, user_id)
-        prompt = SEMANTIC_PROMPT.format(history=json.dumps(history, ensure_ascii=False),
-                                       db_state=json.dumps(db_state, ensure_ascii=False),
-                                       user_profile=json.dumps(user_profile, ensure_ascii=False),
-                                       pending_delete=get_ctx(user_id, "pending_delete", ""))
-        logging.info(f"Sending to OpenAI: {text}")
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text}
-            ],
-        )
-        raw = resp.choices[0].message.content.strip()
-        logging.info(f"🤖 RAW: {raw}")
-        try:
-            with open("/opt/aura-assistant/openai_raw.log", "a", encoding="utf-8") as f:
-                f.write(f"\n=== RAW ({user_id}) ===\n{text}\n{raw}\n")
-        except Exception:
-            logging.warning("Failed to write to openai_raw.log")
-        actions = extract_json_blocks(raw)
-        if not actions:
-            if wants_expand(text) and get_ctx(user_id, "last_action") == "show_lists":
-                logging.info("No actions, but expanding lists due to context")
-                await expand_all_lists(update, conn, user_id, context)
-                return
-            logging.warning("No valid JSON actions from OpenAI")
-            await update.message.reply_text("⚠️ Модель ответила не в JSON-формате.")
-            await send_menu(update, context)
-            return
-        await route_actions(update, context, actions, user_id, text)
-        set_ctx(user_id, history=history + [text])
+                    if pending_confirmation:
+                        await update.message.reply_text("Хорошо, отмена.")
+                        set_ctx(user_id, pending_confirmation=None)
+                history = get_ctx(user_id, "history", [])
+                set_ctx(user_id, history=history + [command_text])
+                continue
+            db_state = {
+                "lists": {n: [t for _, t in get_list_tasks(conn, user_id, n)] for n in get_all_lists(conn, user_id)},
+                "last_list": get_ctx(user_id, "last_list"),
+                "pending_delete": get_ctx(user_id, "pending_delete")
+            }
+            user_profile = get_user_profile(conn, user_id)
+            prompt = SEMANTIC_PROMPT.format(history=json.dumps(history, ensure_ascii=False),
+                                           db_state=json.dumps(db_state, ensure_ascii=False),
+                                           user_profile=json.dumps(user_profile, ensure_ascii=False),
+                                           pending_delete=get_ctx(user_id, "pending_delete", ""))
+            logging.info(f"Sending to OpenAI: {command_text}")
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": command_text}
+                ],
+            )
+            raw = resp.choices[0].message.content.strip()
+            logging.info(f"🤖 RAW: {raw}")
+            try:
+                with open("/opt/aura-assistant/openai_raw.log", "a", encoding="utf-8") as f:
+                    f.write(f"\n=== RAW ({user_id}) ===\n{command_text}\n{raw}\n")
+            except Exception:
+                logging.warning("Failed to write to openai_raw.log")
+            actions = extract_json_blocks(raw)
+            if not actions:
+                if wants_expand(command_text) and get_ctx(user_id, "last_action") == "show_lists":
+                    logging.info("No actions, but expanding lists due to context")
+                    await expand_all_lists(update, conn, user_id, context)
+                    continue
+                logging.warning("No valid JSON actions from OpenAI")
+                await update.message.reply_text("⚠️ Модель ответила не в JSON-формате.")
+                await send_menu(update, context)
+                continue
+            await route_actions(update, context, actions, user_id, command_text)
+            history = get_ctx(user_id, "history", [])
+            set_ctx(user_id, history=history + [command_text])
     except Exception as e:
         logging.exception(f"❌ handle_text error: {e}")
         await update.message.reply_text("Произошла ошибка при обработке. Проверь логи.")
