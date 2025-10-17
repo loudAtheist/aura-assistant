@@ -39,6 +39,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ========= DIALOG CONTEXT (per-user) =========
 SESSION: dict[int, dict] = {}  # { user_id: {"last_action": str, "last_list": str, "history": [str], "pending_delete": str, "pending_confirmation": dict} }
+SIGNIFICANT_ACTIONS = {"create", "add_task", "move_entity", "mark_done", "restore_task", "delete_task", "delete_list"}
 
 def set_ctx(user_id: int, **kw):
     sess = SESSION.get(
@@ -85,6 +86,7 @@ SEMANTIC_PROMPT = """
 - Если список запрошен, но отсутствует в db_state.lists — верни clarify с вопросом «Списка *<имя>* нет. Создать?» и meta.pending = «<имя>».
 - Если в запросе несколько задач (например, «добавь постирать ковер помыть машину»), используй ключ tasks для множественного добавления.
 - Если в запросе несколько задач для завершения (например, «лук молоко хлеб куплены»), используй ключ tasks для множественного mark_done.
+- Если пользователь вводит усечённое слово, но намерение однозначно читается ("спис", "удал", "добав"), интерпретируй его по контексту без дополнительного уточнения.
 - Поиск задач (например, «найди задачи с договор») должен быть регистронезависимым и искать по частичному совпадению.
 - Команда «Покажи удалённые задачи» → action: show_deleted_tasks, entity_type: task.
 - Удаление списка требует подтверждения («да»/«нет»), после «да» список удаляется, контекст очищается.
@@ -182,6 +184,31 @@ def extract_tasks_from_question(question: str) -> list[str]:
     if not question:
         return []
     return [m.strip() for m in re.findall(r"'([^']+)'", question)]
+
+
+def extract_tasks_from_phrase(phrase: str) -> list[str]:
+    if not phrase:
+        return []
+    split_pattern = r"(?:[,;]|\bи\b|\bкуплен[аоы]?\b|\bкуплены\b|\bготов[аоы]?\b|\bвыполнен[аоы]?\b|\bсделан[аоы]?\b)"
+    raw_parts = [
+        p.strip()
+        for p in re.split(split_pattern, phrase, flags=re.IGNORECASE)
+        if p and p.strip()
+    ]
+    parts: list[str] = []
+    for part in raw_parts:
+        cleaned = re.sub(r"\b(куплен[аоы]?|куплены|готов[аоы]?|выполнен[аоы]?|сделан[аоы]?)\b", " ", part, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if cleaned:
+            parts.append(cleaned)
+    unique_parts: list[str] = []
+    seen = set()
+    for part in parts:
+        lower = part.lower()
+        if lower not in seen:
+            seen.add(lower)
+            unique_parts.append(part)
+    return unique_parts if len(unique_parts) > 1 else []
 
 def split_user_commands(text: str) -> list[str]:
     if not text:
@@ -336,9 +363,10 @@ async def expand_all_lists(update: Update, conn, user_id: int, context: ContextT
     await update.message.reply_text(txt, parse_mode="Markdown")
     set_ctx(user_id, last_action="show_lists")
 
-async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, actions: list, user_id: int, original_text: str):
+async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, actions: list, user_id: int, original_text: str) -> list[str]:
     conn = get_conn()
     logging.info(f"Processing actions: {json.dumps(actions)}")
+    executed_actions: list[str] = []
     pending_delete = get_ctx(user_id, "pending_delete")
     if original_text.lower() in ["да", "yes"] and pending_delete:
         try:
@@ -348,19 +376,20 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 await update.message.reply_text(f"🗑 Список *{pending_delete}* удалён.", parse_mode="Markdown")
                 set_ctx(user_id, pending_delete=None, last_list=None)
                 logging.info(f"Confirmed delete_list: {pending_delete}")
+                executed_actions.append("delete_list")
             else:
                 await update.message.reply_text(f"⚠️ Список *{pending_delete}* не найден.")
                 set_ctx(user_id, pending_delete=None)
-            return
+            return executed_actions
         except Exception as e:
             logging.exception(f"Delete error: {e}")
             await update.message.reply_text("⚠️ Ошибка удаления.")
             set_ctx(user_id, pending_delete=None)
-            return
+            return executed_actions
     elif original_text.lower() in ["нет", "no"] and pending_delete:
         await update.message.reply_text("Удаление отменено.")
         set_ctx(user_id, pending_delete=None)
-        return
+        return executed_actions
     for obj in actions:
         action = obj.get("action", "unknown")
         entity_type = obj.get("entity_type", "task")
@@ -407,6 +436,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 else:
                     await update.message.reply_text(f"🆕 Создан список *{obj['list']}*", parse_mode="Markdown")
                 set_ctx(user_id, last_action="create_list", last_list=obj["list"])
+                executed_actions.append("create")
             except Exception as e:
                 logging.exception(f"Create list error: {e}")
                 await update.message.reply_text("⚠️ Не удалось создать список. Проверь логи.")
@@ -430,6 +460,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     else:
                         await update.message.reply_text(f"⚠️ Задача *{title}* уже есть в списке *{list_name}*.")
                 set_ctx(user_id, last_action="add_task", last_list=list_name)
+                executed_actions.append("add_task")
             except Exception as e:
                 logging.exception(f"Add task error: {e}")
                 await update.message.reply_text("⚠️ Не удалось добавить задачу. Проверь логи.")
@@ -588,6 +619,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     if deleted:
                         await update.message.reply_text(f"🗑 Список *{list_name}* удалён.", parse_mode="Markdown")
                         set_ctx(user_id, last_action="delete_list", last_list=None, pending_delete=None)
+                        executed_actions.append("delete_list")
                     else:
                         await update.message.reply_text(f"⚠️ Список *{list_name}* не найден.")
                         set_ctx(user_id, pending_delete=None)
@@ -606,22 +638,32 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
         elif action == "mark_done" and list_name:
             try:
                 logging.info(f"Marking tasks done in list: {list_name}")
+                tasks_to_mark: list[str] = []
                 if obj.get("tasks"):
-                    completed_tasks = []
-                    for t in obj["tasks"]:
-                        logging.info(f"Marking task done: {t} in list: {list_name}")
-                        deleted, matched = mark_task_done_fuzzy(conn, user_id, list_name, t)
-                        if deleted:
-                            completed_tasks.append(matched)
-                    if completed_tasks:
-                        await update.message.reply_text(f"✔️ Готово: {', '.join(completed_tasks)}.", parse_mode="Markdown")
+                    tasks_to_mark = list(obj["tasks"])
+                elif title:
+                    multi = extract_tasks_from_phrase(title)
+                    if multi:
+                        tasks_to_mark = multi
                     else:
-                        await update.message.reply_text("⚠️ Не нашёл указанные задачи.")
+                        tasks_to_mark = [title]
+                completed_tasks: list[str] = []
+                for task_phrase in tasks_to_mark:
+                    logging.info(f"Marking task done: {task_phrase} in list: {list_name}")
+                    deleted, matched = mark_task_done_fuzzy(conn, user_id, list_name, task_phrase)
+                    if deleted:
+                        completed_tasks.append(matched)
+                if completed_tasks:
+                    await update.message.reply_text(f"✔️ Готово: {', '.join(completed_tasks)}.", parse_mode="Markdown")
+                    executed_actions.append("mark_done")
+                elif tasks_to_mark:
+                    await update.message.reply_text("⚠️ Не нашёл указанные задачи.")
                 elif title:
                     logging.info(f"Marking task done: {title} in list: {list_name}")
                     deleted, matched = mark_task_done_fuzzy(conn, user_id, list_name, title)
                     if deleted:
                         await update.message.reply_text(f"✔️ Готово: *{matched}*.", parse_mode="Markdown")
+                        executed_actions.append("mark_done")
                     else:
                         await update.message.reply_text("⚠️ Не нашёл такую задачу.")
                 set_ctx(user_id, last_action="mark_done", last_list=list_name)
@@ -664,6 +706,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                         if updated:
                             await update.message.reply_text(f"🔄 Перемещено: *{matched}* в *{obj['to_list']}*.", parse_mode="Markdown")
                             set_ctx(user_id, last_action="move_entity", last_list=obj["to_list"])
+                            executed_actions.append("move_entity")
                         else:
                             await update.message.reply_text(f"⚠️ Не удалось переместить *{matched}*. Проверь, есть ли такая задача.")
                     else:
@@ -673,6 +716,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     if updated:
                         await update.message.reply_text(f"🔄 Перемещено: *{title}* в *{obj['to_list']}*.", parse_mode="Markdown")
                         set_ctx(user_id, last_action="move_entity", last_list=obj["to_list"])
+                        executed_actions.append("move_entity")
                     else:
                         await update.message.reply_text(f"⚠️ Не удалось переместить *{title}*. Проверь, есть ли такая задача.")
             except Exception as e:
@@ -721,6 +765,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     matched = title if restored else None
                 if restored:
                     await update.message.reply_text(f"🔄 Задача *{matched}* восстановлена в списке *{list_name}*.", parse_mode="Markdown")
+                    executed_actions.append("restore_task")
                 else:
                     await update.message.reply_text(f"⚠️ Не удалось восстановить *{title}*.")
                 set_ctx(user_id, last_action="restore_task", last_list=list_name)
@@ -738,6 +783,8 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
             try:
                 question_text_raw = meta.get("question") or ""
                 logging.info(f"Clarify: {question_text_raw}")
+                if meta.get("confirmed"):
+                    set_ctx(user_id, pending_confirmation=None)
                 pending = meta.get("pending")
                 if pending:
                     question_lower = question_text_raw.lower()
@@ -804,7 +851,6 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                             }
                         )
                     set_ctx(user_id, pending_confirmation=confirmation_payload)
-                await send_menu(update, context)
             except Exception as e:
                 logging.exception(f"Clarify error: {e}")
                 await update.message.reply_text("⚠️ Не удалось уточнить. Проверь логи.")
@@ -841,6 +887,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
             await update.message.reply_text("🤔 Не понял, что нужно сделать.")
             await send_menu(update, context)
         logging.info(f"User {user_id}: {original_text} -> Action: {action}")
+    return executed_actions
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_text: str | None = None):
     user_id = update.effective_user.id
@@ -884,8 +931,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
                     if pending_confirmation:
                         await update.message.reply_text("Хорошо, отмена.")
                         set_ctx(user_id, pending_confirmation=None)
-                history = get_ctx(user_id, "history", [])
-                set_ctx(user_id, history=history + [command_text])
                 continue
             db_state = {
                 "lists": {n: [t for _, t in get_list_tasks(conn, user_id, n)] for n in get_all_lists(conn, user_id)},
@@ -922,9 +967,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
                 await update.message.reply_text("⚠️ Модель ответила не в JSON-формате.")
                 await send_menu(update, context)
                 continue
-            await route_actions(update, context, actions, user_id, command_text)
-            history = get_ctx(user_id, "history", [])
-            set_ctx(user_id, history=history + [command_text])
+            executed_actions = await route_actions(update, context, actions, user_id, command_text) or []
+            if any(action in SIGNIFICANT_ACTIONS for action in executed_actions):
+                history = get_ctx(user_id, "history", [])
+                set_ctx(user_id, history=history + [command_text])
     except Exception as e:
         logging.exception(f"❌ handle_text error: {e}")
         await update.message.reply_text("Произошла ошибка при обработке. Проверь логи.")
@@ -991,6 +1037,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pending_conf = get_ctx(user_id, "pending_confirmation")
             if pending_conf:
                 await handle_pending_confirmation(query.message, context, get_conn(), user_id, pending_conf)
+                set_ctx(user_id, pending_confirmation=None)
                 await query.edit_message_text("✅ Подтверждение получено.")
             else:
                 await query.edit_message_text("⚠️ Нет действий для подтверждения.")

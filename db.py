@@ -1,8 +1,73 @@
 import sqlite3, json, os, re
 from Levenshtein import distance
 import logging
+from typing import Iterable, List, Tuple
 
 DB_PATH = "/opt/aura-assistant/db.sqlite3"
+
+_TOKEN_STOPWORDS = {
+    "и",
+    "да",
+    "нет",
+    "куплены",
+    "куплено",
+    "куплена",
+    "куплен",
+    "готово",
+    "готовы",
+    "готов",
+    "выполнено",
+    "выполнены",
+    "выполнен",
+    "сделано",
+    "сделаны",
+    "сделан",
+}
+
+
+def _tokenize(text: str) -> List[str]:
+    parts = re.split(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", (text or "").lower())
+    return [p for p in parts if p and p not in _TOKEN_STOPWORDS]
+
+
+def _score_candidates(
+    pattern_tokens: Iterable[str],
+    cleaned_pattern: str,
+    candidates: Iterable[Tuple[int, str, str]],
+) -> Tuple[int, str, str] | None:
+    pt_set = set(pattern_tokens)
+    cleaned_lower = cleaned_pattern.lower()
+    scored: list[tuple[int, int, int, Tuple[int, str, str]]] = []
+    for candidate in candidates:
+        cand_id, cand_title, cand_meta = candidate
+        title_lower = cand_title.lower()
+        tokens = set(_tokenize(cand_title))
+        overlap = len(pt_set & tokens) if pt_set else 0
+        substring_match = False
+        if pt_set:
+            substring_match = any(
+                len(token) > 2 and token in title_lower for token in pt_set
+            )
+        if cleaned_lower and cleaned_lower in title_lower:
+            substring_match = True
+        if not pt_set and cleaned_lower:
+            substring_match = cleaned_lower in title_lower
+        if pt_set and overlap == 0 and not substring_match:
+            continue
+        edit_distance = distance(title_lower, cleaned_lower) if cleaned_lower else 0
+        scored.append((-overlap, edit_distance, len(title_lower), candidate))
+    if not scored and cleaned_lower:
+        for candidate in candidates:
+            cand_id, cand_title, cand_meta = candidate
+            title_lower = cand_title.lower()
+            if cleaned_lower in title_lower or title_lower in cleaned_lower:
+                return candidate
+        return None
+    if not scored:
+        return None
+    scored.sort()
+    best = scored[0][3]
+    return best
 
 ENTITIES_DDL = """
 CREATE TABLE IF NOT EXISTS entities (
@@ -234,6 +299,7 @@ def mark_task_done_fuzzy(conn, user_id, list_name, pattern):
         if not q:
             logging.info(f"Invalid pattern after cleaning for fuzzy mark done in list '{list_name}' for user {user_id}")
             return 0, None
+        pattern_tokens = _tokenize(pattern)
         cur = conn.cursor()
         cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
         row = cur.fetchone()
@@ -241,17 +307,17 @@ def mark_task_done_fuzzy(conn, user_id, list_name, pattern):
             logging.info(f"No list '{list_name}' found for user {user_id}")
             return 0, None
         list_id = row["id"]
-        cur.execute("""SELECT id, title, meta FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE AND json_extract(meta, '$.status') != 'done')""", 
+        cur.execute("""SELECT id, title, meta FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE AND json_extract(meta, '$.status') != 'done')""",
                     (user_id, list_id))
         candidates = [(r["id"], r["title"], r["meta"]) for r in cur.fetchall()]
         if not candidates:
             logging.info(f"No tasks found in list '{list_name}' for user {user_id}")
             return 0, None
-        candidates.sort(key=lambda x: distance(x[1].lower(), q.lower()))
-        if distance(candidates[0][1].lower(), q.lower()) > len(q) // 2:
+        chosen = _score_candidates(pattern_tokens, q, candidates)
+        if not chosen:
             logging.info(f"No close match for pattern '{q}' in list '{list_name}' for user {user_id}")
             return 0, None
-        chosen_id, chosen_title, meta = candidates[0]
+        chosen_id, chosen_title, meta = chosen
         try:
             meta = json.loads(meta) if meta else {}
         except:
@@ -328,8 +394,9 @@ def restore_task(conn, user_id, list_name, task_title):
         cur.execute("""SELECT id, meta FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND title=? LIMIT 1""", (user_id, list_id, task_title))
         t = cur.fetchone()
         if not t:
-            logging.info(f"No task '{task_title}' found in list '{list_name}' for user {user_id}")
-            return 0
+            logging.info(f"No task '{task_title}' found in list '{list_name}' for user {user_id}', fallback to fuzzy")
+            restored, matched = restore_task_fuzzy(conn, user_id, list_name, task_title)
+            return 1 if restored else 0
         meta = json.loads(t["meta"]) if t["meta"] else {}
         meta["deleted"] = False
         if "status" in meta:
@@ -350,6 +417,7 @@ def restore_task_fuzzy(conn, user_id, list_name, pattern):
         if not q:
             logging.info(f"Invalid pattern after cleaning for fuzzy restore in list '{list_name}' for user {user_id}")
             return 0, None
+        pattern_tokens = _tokenize(pattern)
         cur = conn.cursor()
         cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
         row = cur.fetchone()
@@ -357,17 +425,33 @@ def restore_task_fuzzy(conn, user_id, list_name, pattern):
             logging.info(f"No list '{list_name}' found for user {user_id}")
             return 0, None
         list_id = row["id"]
-        cur.execute("""SELECT id, title, meta FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND json_extract(meta, '$.deleted') = true""", 
-                    (user_id, list_id))
+        cur.execute(
+            """
+            SELECT id, title, meta
+            FROM entities
+            WHERE user_id=?
+              AND type='task'
+              AND parent_id=?
+              AND (
+                    json_extract(meta, '$.deleted') = true
+                 OR json_extract(meta, '$.status') = 'done'
+              )
+            """,
+            (user_id, list_id),
+        )
         candidates = [(r["id"], r["title"], r["meta"]) for r in cur.fetchall()]
         if not candidates:
             logging.info(f"No deleted tasks found in list '{list_name}' for user {user_id}")
             return 0, None
-        candidates.sort(key=lambda x: distance(x[1].lower(), q.lower()))
-        if distance(candidates[0][1].lower(), q.lower()) > len(q) // 2:
+        logging.info(
+            "Restore search candidates: %s",
+            [title for _, title, _ in candidates],
+        )
+        chosen = _score_candidates(pattern_tokens, q, candidates)
+        if not chosen:
             logging.info(f"No close match for pattern '{q}' in list '{list_name}' for user {user_id}")
             return 0, None
-        chosen_id, chosen_title, meta = candidates[0]
+        chosen_id, chosen_title, meta = chosen
         try:
             meta = json.loads(meta) if meta else {}
         except:
@@ -634,7 +718,7 @@ def update_entity(conn, user_id: int, entity_type: str, title: str, new_title: s
             params.append(json.dumps(meta))
     if not updates:
         return None
-    sql = f"UPDATE entities SET {", ".join(updates)} WHERE user_id=? AND type=? AND title=?"
+    sql = "UPDATE entities SET " + ", ".join(updates) + " WHERE user_id=? AND type=? AND title=?"
     params.extend([user_id, entity_type, title])
     cur.execute(sql, params)
     conn.commit()
