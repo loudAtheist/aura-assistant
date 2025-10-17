@@ -258,7 +258,7 @@ def split_user_commands(text: str) -> list[str]:
     if not text:
         return []
     normalized = text.replace("\r", "\n")
-    raw_parts = re.split(r'(?:[.,;]+|\n+|\bи\b)', normalized, flags=re.IGNORECASE)
+    raw_parts = re.split(r'(?:[.,;]+|\n+)', normalized, flags=re.IGNORECASE)
     parts = [p.strip() for p in raw_parts if p and p.strip()]
     commands: list[str] = []
     last_create_verb: str | None = None
