@@ -11,7 +11,7 @@ from db import (
     rename_list, normalize_text, init_db, get_conn, get_all_lists, get_list_tasks, add_task, delete_list,
     mark_task_done, mark_task_done_fuzzy, delete_task, restore_task, find_list, fetch_task, fetch_list_by_task,
     delete_task_fuzzy, delete_task_by_index, create_list, move_entity, get_all_tasks, update_user_profile,
-    get_user_profile, get_completed_tasks, search_tasks, update_task, update_task_by_index, restore_task_fuzzy
+    get_user_profile, get_completed_tasks, get_deleted_tasks, search_tasks, update_task, update_task_by_index, restore_task_fuzzy
 )
 
 # ========= ENV =========
@@ -81,14 +81,17 @@ SEMANTIC_PROMPT = """
 - Если пользователь говорит «туда», «в него», «этот список» — это последний упомянутый список (db_state.last_list или история).
 - Приоритет точного имени списка над контекстом (например, «Домашние дела» важнее last_list).
 - Команда «Покажи список <название>» или «покажи <название>» → показать задачи (action: show_tasks, entity_type: task, list: <название>).
+- Если в одной команде несколько раз встречается «список <имя>» для создания — верни отдельные действия create для каждого списка в одном JSON-массиве.
+- Если список запрошен, но отсутствует в db_state.lists — верни clarify с вопросом «Списка *<имя>* нет. Создать?» и meta.pending = «<имя>».
 - Если в запросе несколько задач (например, «добавь постирать ковер помыть машину»), используй ключ tasks для множественного добавления.
 - Если в запросе несколько задач для завершения (например, «лук молоко хлеб куплены»), используй ключ tasks для множественного mark_done.
 - Поиск задач (например, «найди задачи с договор») должен быть регистронезависимым и искать по частичному совпадению.
+- Команда «Покажи удалённые задачи» → action: show_deleted_tasks, entity_type: task.
 - Удаление списка требует подтверждения («да»/«нет»), после «да» список удаляется, контекст очищается.
 - Восстановление задачи (например, «верни задачу») поддерживает fuzzy-поиск по частичному совпадению.
 - Изменение задачи (например, «измени четвёртый пункт») поддерживает указание по индексу (meta.by_index).
 - Перенос задачи (например, «перенеси задачу») поддерживает fuzzy-поиск по частичному совпадению (meta.fuzzy: true).
-- Решение: create/add_task/show_lists/show_tasks/show_all_tasks/mark_done/delete_task/delete_list/move_entity/search_entity/rename_list/update_profile/restore_task/show_completed_tasks/update_task/unknown.
+- Решение: create/add_task/show_lists/show_tasks/show_all_tasks/mark_done/delete_task/delete_list/move_entity/search_entity/rename_list/update_profile/restore_task/show_completed_tasks/show_deleted_tasks/update_task/unknown.
 - Если социальная реплика (привет, благодарность, «как дела?») — action: say.
 - Если запрос неясен — action: clarify с вопросом.
 - Нормализуй вход (регистры, пробелы, ошибки речи), но сохраняй смысл.
@@ -98,7 +101,7 @@ SEMANTIC_PROMPT = """
 
 Формат ответа (строго JSON; без текста вне JSON):
 - Для действий над базой:
-{{ "action": "create|add_task|show_lists|show_tasks|show_all_tasks|mark_done|delete_task|delete_list|move_entity|search_entity|rename_list|update_profile|restore_task|show_completed_tasks|update_task|unknown",
+{{ "action": "create|add_task|show_lists|show_tasks|show_all_tasks|mark_done|delete_task|delete_list|move_entity|search_entity|rename_list|update_profile|restore_task|show_completed_tasks|show_deleted_tasks|update_task|unknown",
   "entity_type": "list|task|user_profile",
   "list": "имя списка",
   "title": "имя задачи или заметки",
@@ -121,15 +124,18 @@ SEMANTIC_PROMPT = """
 
 Примеры:
 - «Создай список Работа внеси задачи исправить договор сходить к нотариусу» → {{ "action": "create", "entity_type": "list", "list": "Работа", "tasks": ["Исправить договор", "Сходить к нотариусу"] }}
+- «Создай список Работа и список Домашние дела» → [{{ "action": "create", "entity_type": "list", "list": "Работа" }}, {{ "action": "create", "entity_type": "list", "list": "Домашние дела" }}]
 - «В список Домашние дела добавь постирать ковер помыть машину купить маленький нож» → {{ "action": "add_task", "entity_type": "task", "list": "Домашние дела", "tasks": ["Постирать ковер", "Помыть машину", "Купить маленький нож"] }}
 - «Лук молоко хлеб куплены» → {{ "action": "mark_done", "entity_type": "task", "list": "Домашние дела", "tasks": ["Купить лук", "Купить молоко", "Купить хлеб"], "meta": {{ "fuzzy": true }} }}
 - «Переименуй список Покупки в Шопинг» → {{ "action": "rename_list", "entity_type": "list", "list": "Покупки", "title": "Шопинг" }}
 - «Из списка Работа пункт Сделать уборку в гараже Перенеси в Домашние дела» → {{ "action": "move_entity", "entity_type": "task", "title": "Сделать уборку в гараже", "list": "Работа", "to_list": "Домашние дела", "meta": {{ "fuzzy": true }} }}
 - «Сходить к нотариусу выполнен-конец» → {{ "action": "mark_done", "entity_type": "task", "list": "<последний список>", "title": "Сходить к нотариусу" }}
 - «Покажи Домашние дела» → {{ "action": "show_tasks", "entity_type": "task", "list": "Домашние дела" }}
+- «Покажи Домашние дела» (списка ещё нет) → {{ "action": "clarify", "meta": {{ "question": "Списка *Домашние дела* нет. Создать?", "pending": "Домашние дела" }} }}
 - «Покажи все мои дела» → {{ "action": "show_all_tasks", "entity_type": "task" }}
 - «Найди задачи с договор» → {{ "action": "search_entity", "entity_type": "task", "meta": {{ "pattern": "договор" }} }}
 - «Покажи выполненные задачи» → {{ "action": "show_completed_tasks", "entity_type": "task" }}
+- «Покажи удалённые задачи» → {{ "action": "show_deleted_tasks", "entity_type": "task" }}
 - «Я живу в Алматы, работаю в продажах» → {{ "action": "update_profile", "entity_type": "user_profile", "meta": {{ "city": "Алматы", "profession": "продажи" }} }}
 - «Восстанови задачу Позвонить клиенту в список Работа» → {{ "action": "restore_task", "entity_type": "task", "list": "Работа", "title": "Позвонить клиенту", "meta": {{ "fuzzy": true }} }}
 - «Удали список Шопинг» → {{ "action": "clarify", "meta": {{ "question": "Уверен, что хочешь удалить список Шопинг? Скажи 'да' или 'нет'.", "pending": "Шопинг" }} }}
@@ -205,7 +211,25 @@ def split_user_commands(text: str) -> list[str]:
         last_create_verb = None
         commands.append(part)
 
-    return commands
+    expanded_commands: list[str] = []
+    for command in commands:
+        create_match = re.search(r"\b(созда[ййтеь]*)\b", command, flags=re.IGNORECASE)
+        list_occurrences = list(re.finditer(r"(?:список|лист)\s+", command, flags=re.IGNORECASE))
+        if create_match and len(list_occurrences) > 1:
+            prefix = create_match.group(0)
+            for idx, match in enumerate(list_occurrences):
+                start = match.start()
+                end = list_occurrences[idx + 1].start() if idx + 1 < len(list_occurrences) else len(command)
+                fragment = command[start:end].strip()
+                fragment = re.sub(r"^[,\s]+", "", fragment)
+                fragment = re.sub(r"\s*(?:и|,)+\s*$", "", fragment, flags=re.IGNORECASE)
+                fragment = fragment.strip(" .!?:;«»'\"")
+                if fragment:
+                    expanded_commands.append(f"{prefix} {fragment}".strip())
+            continue
+        expanded_commands.append(command.strip())
+
+    return expanded_commands
 
 def map_tasks_to_lists(conn, user_id: int, task_titles: list[str]) -> dict[str, str]:
     mapping: dict[str, str] = {}
@@ -267,6 +291,25 @@ async def handle_pending_confirmation(message, context: ContextTypes.DEFAULT_TYP
         else:
             await message.reply_text("⚠️ Не удалось обработать удаление задач.")
         set_ctx(user_id, pending_confirmation=None)
+    elif conf_type == "create_list":
+        list_to_create = pending_confirmation.get("list")
+        if not list_to_create:
+            await message.reply_text("⚠️ Не понимаю, какой список создать.")
+            set_ctx(user_id, pending_confirmation=None)
+            return
+        existing = find_list(conn, user_id, list_to_create)
+        if existing:
+            await message.reply_text(f"⚠️ Список *{list_to_create}* уже существует.", parse_mode="Markdown")
+            set_ctx(user_id, pending_confirmation=None, last_list=list_to_create)
+            return
+        try:
+            create_list(conn, user_id, list_to_create)
+            await message.reply_text(f"🆕 Создан список *{list_to_create}*", parse_mode="Markdown")
+            set_ctx(user_id, pending_confirmation=None, last_action="create_list", last_list=list_to_create)
+        except Exception as e:
+            logging.exception(f"Create list via confirmation error: {e}")
+            await message.reply_text("⚠️ Не удалось создать список. Проверь логи.")
+            set_ctx(user_id, pending_confirmation=None)
     else:
         await message.reply_text("⚠️ Не удалось обработать подтверждение. Попробуй сформулировать команду заново.")
         set_ctx(user_id, pending_confirmation=None)
@@ -415,12 +458,30 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
         elif action == "show_tasks" and list_name:
             try:
                 logging.info(f"Showing tasks for list: {list_name}")
+                if not find_list(conn, user_id, list_name):
+                    question = f"⚠️ Списка *{list_name}* нет. Создать?"
+                    keyboard = [[
+                        InlineKeyboardButton("Да", callback_data=f"create_list_yes:{list_name}"),
+                        InlineKeyboardButton("Нет", callback_data="create_list_no"),
+                    ]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text(question, parse_mode="Markdown", reply_markup=reply_markup)
+                    set_ctx(
+                        user_id,
+                        pending_confirmation={
+                            "type": "create_list",
+                            "list": list_name,
+                            "question": question,
+                        },
+                        pending_delete=None,
+                    )
+                    continue
                 items = get_list_tasks(conn, user_id, list_name)
                 if items:
                     txt = "\n".join([f"{i}. {t}" for i, t in items])
                     await update.message.reply_text(f"📋 *{list_name}:*\n{txt}", parse_mode="Markdown")
                 else:
-                    await update.message.reply_text(f"Список *{list_name}* пуст.", parse_mode="Markdown")
+                    await update.message.reply_text(f"📋 *{list_name}:*\n— пусто —", parse_mode="Markdown")
                 set_ctx(user_id, last_action="show_tasks", last_list=list_name)
             except Exception as e:
                 logging.exception(f"Show tasks error: {e}")
@@ -447,6 +508,40 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
             except Exception as e:
                 logging.exception(f"Show all tasks error: {e}")
                 await update.message.reply_text("⚠️ Не удалось получить дела. Проверь логи.")
+        elif action == "show_completed_tasks":
+            try:
+                logging.info("Showing completed tasks")
+                tasks = get_completed_tasks(conn, user_id, limit=15)
+                if tasks:
+                    lines = []
+                    for list_title, task_title in tasks:
+                        list_display = list_title or "Без списка"
+                        lines.append(f"✅ *{list_display}*: {task_title}")
+                    header = "✅ Выполненные задачи (последние 15):\n"
+                    await update.message.reply_text(header + "\n".join(lines), parse_mode="Markdown")
+                else:
+                    await update.message.reply_text("Пока нет выполненных задач 💤")
+                set_ctx(user_id, last_action="show_completed_tasks")
+            except Exception as e:
+                logging.exception(f"Show completed tasks error: {e}")
+                await update.message.reply_text("⚠️ Не удалось получить выполненные задачи. Проверь логи.")
+        elif action == "show_deleted_tasks":
+            try:
+                logging.info("Showing deleted tasks")
+                tasks = get_deleted_tasks(conn, user_id, limit=15)
+                if tasks:
+                    lines = []
+                    for list_title, task_title in tasks:
+                        list_display = list_title or "Без списка"
+                        lines.append(f"🗑 *{list_display}*: {task_title}")
+                    header = "🗑 Удалённые задачи (последние 15):\n"
+                    await update.message.reply_text(header + "\n".join(lines), parse_mode="Markdown")
+                else:
+                    await update.message.reply_text("Пока нет удалённых задач ✨")
+                set_ctx(user_id, last_action="show_deleted_tasks")
+            except Exception as e:
+                logging.exception(f"Show deleted tasks error: {e}")
+                await update.message.reply_text("⚠️ Не удалось получить удалённые задачи. Проверь логи.")
         elif action == "search_entity" and meta.get("pattern"):
             try:
                 logging.info(f"Searching tasks with pattern: {meta['pattern']}")
@@ -641,40 +736,73 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 await update.message.reply_text("⚠️ Не удалось отправить сообщение. Проверь логи.")
         elif action == "clarify" and meta.get("question"):
             try:
-                logging.info(f"Clarify: {meta['question']}")
+                question_text_raw = meta.get("question") or ""
+                logging.info(f"Clarify: {question_text_raw}")
                 pending = meta.get("pending")
                 if pending:
-                    keyboard = [[
-                        InlineKeyboardButton("Да", callback_data=f"clarify_yes:{pending}"),
-                        InlineKeyboardButton("Нет", callback_data="clarify_no"),
-                    ]]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    await update.message.reply_text("🤔 " + meta.get("question"), parse_mode="Markdown", reply_markup=reply_markup)
-                    set_ctx(user_id, pending_delete=pending, pending_confirmation=None)
+                    question_lower = question_text_raw.lower()
+                    if "удал" in question_lower:
+                        keyboard = [[
+                            InlineKeyboardButton("Да", callback_data=f"clarify_yes:{pending}"),
+                            InlineKeyboardButton("Нет", callback_data="clarify_no"),
+                        ]]
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        await update.message.reply_text("🤔 " + question_text_raw, parse_mode="Markdown", reply_markup=reply_markup)
+                        set_ctx(user_id, pending_delete=pending, pending_confirmation=None)
+                    elif "созда" in question_lower:
+                        keyboard = [[
+                            InlineKeyboardButton("Да", callback_data=f"create_list_yes:{pending}"),
+                            InlineKeyboardButton("Нет", callback_data="create_list_no"),
+                        ]]
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        await update.message.reply_text("🤔 " + question_text_raw, parse_mode="Markdown", reply_markup=reply_markup)
+                        set_ctx(
+                            user_id,
+                            pending_confirmation={
+                                "type": "create_list",
+                                "list": pending,
+                                "question": question_text_raw,
+                            },
+                        )
+                    else:
+                        keyboard = [[
+                            InlineKeyboardButton("Да", callback_data="clarify_generic_yes"),
+                            InlineKeyboardButton("Нет", callback_data="clarify_generic_no"),
+                        ]]
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        await update.message.reply_text("🤔 " + question_text_raw, parse_mode="Markdown", reply_markup=reply_markup)
+                        confirmation_payload = {
+                            "question": question_text_raw,
+                            "entity_type": entity_type,
+                            "list": list_name,
+                            "original_text": original_text,
+                            "pending": pending,
+                            "type": "generic",
+                        }
+                        set_ctx(user_id, pending_confirmation=confirmation_payload)
                 else:
                     keyboard = [[
                         InlineKeyboardButton("Да", callback_data="clarify_generic_yes"),
                         InlineKeyboardButton("Нет", callback_data="clarify_generic_no"),
                     ]]
                     reply_markup = InlineKeyboardMarkup(keyboard)
-                    await update.message.reply_text("🤔 " + meta.get("question"), parse_mode="Markdown", reply_markup=reply_markup)
+                    await update.message.reply_text("🤔 " + question_text_raw, parse_mode="Markdown", reply_markup=reply_markup)
                     confirmation_payload = {
-                        "question": meta.get("question"),
+                        "question": question_text_raw,
                         "entity_type": entity_type,
                         "list": list_name,
                         "original_text": original_text,
+                        "type": "generic",
                     }
-                    question_lower = meta.get("question", "").lower()
+                    question_lower = question_text_raw.lower()
                     if entity_type == "task" and "удал" in question_lower:
-                        tasks_to_handle = extract_tasks_from_question(meta.get("question", ""))
+                        tasks_to_handle = extract_tasks_from_question(question_text_raw)
                         confirmation_payload.update(
                             {
                                 "type": "delete_tasks",
                                 "tasks": tasks_to_handle,
                             }
                         )
-                    else:
-                        confirmation_payload["type"] = "generic"
                     set_ctx(user_id, pending_confirmation=confirmation_payload)
                 await send_menu(update, context)
             except Exception as e:
@@ -684,13 +812,31 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
             name_from_text = text_mentions_list_and_name(original_text)
             if name_from_text:
                 logging.info(f"Showing tasks for list from text: {name_from_text}")
+                if not find_list(conn, user_id, name_from_text):
+                    question = f"⚠️ Списка *{name_from_text}* нет. Создать?"
+                    keyboard = [[
+                        InlineKeyboardButton("Да", callback_data=f"create_list_yes:{name_from_text}"),
+                        InlineKeyboardButton("Нет", callback_data="create_list_no"),
+                    ]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text(question, parse_mode="Markdown", reply_markup=reply_markup)
+                    set_ctx(
+                        user_id,
+                        pending_confirmation={
+                            "type": "create_list",
+                            "list": name_from_text,
+                            "question": question,
+                        },
+                    )
+                    continue
                 items = get_list_tasks(conn, user_id, name_from_text)
                 if items:
                     txt = "\n".join([f"{i}. {t}" for i, t in items])
                     await update.message.reply_text(f"📋 *{name_from_text}:*\n{txt}", parse_mode="Markdown")
-                    set_ctx(user_id, last_action="show_tasks", last_list=name_from_text)
-                    continue
-                await update.message.reply_text(f"Список *{name_from_text}* пуст или не существует.")
+                else:
+                    await update.message.reply_text(f"📋 *{name_from_text}:*\n— пусто —", parse_mode="Markdown")
+                set_ctx(user_id, last_action="show_tasks", last_list=name_from_text)
+                continue
             logging.info("Unknown command, no context match")
             await update.message.reply_text("🤔 Не понял, что нужно сделать.")
             await send_menu(update, context)
@@ -850,6 +996,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("⚠️ Нет действий для подтверждения.")
         elif data == "clarify_generic_no":
             await query.edit_message_text("Хорошо, отмена.")
+            set_ctx(user_id, pending_confirmation=None)
+        elif data.startswith("create_list_yes:"):
+            list_name = data.split(":", 1)[1]
+            conn = get_conn()
+            existing = find_list(conn, user_id, list_name)
+            if existing:
+                await query.edit_message_text(f"⚠️ Список *{list_name}* уже существует.", parse_mode="Markdown")
+                set_ctx(user_id, pending_confirmation=None, last_list=list_name)
+            else:
+                try:
+                    create_list(conn, user_id, list_name)
+                    await query.edit_message_text(f"🆕 Создан список *{list_name}*", parse_mode="Markdown")
+                    set_ctx(user_id, pending_confirmation=None, last_action="create_list", last_list=list_name)
+                except Exception as e:
+                    logging.exception(f"Create list via callback error: {e}")
+                    await query.edit_message_text("⚠️ Не удалось создать список. Проверь логи.")
+                    set_ctx(user_id, pending_confirmation=None)
+        elif data == "create_list_no":
+            await query.edit_message_text("Хорошо, не создаю.")
             set_ctx(user_id, pending_confirmation=None)
         else:
             await query.edit_message_text("⚠️ Неизвестная команда.")

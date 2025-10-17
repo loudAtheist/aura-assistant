@@ -382,18 +382,52 @@ def restore_task_fuzzy(conn, user_id, list_name, pattern):
         logging.error(f"SQLite error in restore_task_fuzzy: {e}")
         return 0, None
 
-def get_completed_tasks(conn, user_id):
+def get_completed_tasks(conn, user_id, limit: int = 15):
     try:
         cur = conn.cursor()
-        cur.execute("""SELECT l.title AS list_title, e.title AS task_title, e.meta FROM entities e
-                       LEFT JOIN entities l ON l.id = e.parent_id
-                       WHERE e.user_id=? AND e.type='task' AND (json_extract(e.meta, '$.status') = 'done' OR json_extract(e.meta, '$.deleted') = true)
-                       ORDER BY e.created_at DESC LIMIT 100""", (user_id,))
-        tasks = [(row["list_title"], row["task_title"], json.loads(row["meta"]) if row["meta"] else {}) for row in cur.fetchall()]
-        logging.info(f"Retrieved {len(tasks)} completed/deleted tasks for user {user_id}")
+        cur.execute(
+            """
+            SELECT l.title AS list_title, e.title AS task_title
+            FROM entities e
+            LEFT JOIN entities l ON l.id = e.parent_id
+            WHERE e.user_id=?
+              AND e.type='task'
+              AND json_extract(e.meta, '$.status') = 'done'
+              AND (json_extract(e.meta, '$.deleted') IS NULL OR json_extract(e.meta, '$.deleted') IS NOT TRUE)
+            ORDER BY e.created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        tasks = [(row["list_title"], row["task_title"]) for row in cur.fetchall()]
+        logging.info(f"Retrieved {len(tasks)} completed tasks for user {user_id}")
         return tasks
     except sqlite3.Error as e:
         logging.error(f"SQLite error in get_completed_tasks: {e}")
+        return []
+
+
+def get_deleted_tasks(conn, user_id, limit: int = 15):
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT l.title AS list_title, e.title AS task_title
+            FROM entities e
+            LEFT JOIN entities l ON l.id = e.parent_id
+            WHERE e.user_id=?
+              AND e.type='task'
+              AND json_extract(e.meta, '$.deleted') = true
+            ORDER BY e.created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        tasks = [(row["list_title"], row["task_title"]) for row in cur.fetchall()]
+        logging.info(f"Retrieved {len(tasks)} deleted tasks for user {user_id}")
+        return tasks
+    except sqlite3.Error as e:
+        logging.error(f"SQLite error in get_deleted_tasks: {e}")
         return []
 
 def search_tasks(conn, user_id, pattern):
