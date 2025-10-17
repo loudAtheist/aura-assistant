@@ -129,6 +129,7 @@ SEMANTIC_PROMPT = """
 - Если в одной команде несколько раз встречается «список <имя>» для создания — верни отдельные действия create для каждого списка в одном JSON-массиве.
 - Если список запрошен, но отсутствует в db_state.lists — верни clarify с вопросом «Списка *<имя>* нет. Создать?» и meta.pending = «<имя>».
 - Если в запросе несколько задач (например, «добавь постирать ковер помыть машину»), используй ключ tasks для множественного добавления.
+- Если после глагола «добавь» перечислены элементы через запятые или союз «и» (например, «добавь хлеб, молоко и сыр» или «в покупки добавь хлеб, молоко, сыр»), трактуй каждое перечисление как отдельную задачу одного действия add_task. Если список не назван явно, опирайся на db_state.last_list. Не переходи к clarify, когда намерение очевидно.
 - Если в запросе несколько задач для завершения (например, «лук молоко хлеб куплены»), используй ключ tasks для множественного mark_done.
 - Если пользователь вводит усечённое слово, но намерение однозначно читается ("спис", "удал", "добав"), интерпретируй его по контексту без дополнительного уточнения.
 - Поиск задач (например, «найди задачи с договор») должен быть регистронезависимым и искать по частичному совпадению.
@@ -253,6 +254,65 @@ def extract_tasks_from_phrase(phrase: str) -> list[str]:
             seen.add(lower)
             unique_parts.append(part)
     return unique_parts if len(unique_parts) > 1 else []
+
+
+def extract_task_list_from_command(command: str, list_name: str | None = None, base_title: str | None = None) -> list[str]:
+    if not command:
+        return []
+    match = re.search(r"\bдобав[а-яё]*\b", command, flags=re.IGNORECASE)
+    if not match:
+        return []
+    segment = command[match.end():].strip()
+    if not segment:
+        return []
+    if list_name:
+        pattern = re.compile(rf"^(?:в|во)\s+(?:список|лист)?\s*{re.escape(list_name)}\b", flags=re.IGNORECASE)
+        segment = pattern.sub("", segment, count=1).strip()
+    segment = re.sub(r"^(?:в|во)\s+(?:список|лист)\s+[\w\s]+", "", segment, count=1, flags=re.IGNORECASE).strip()
+    segment = segment.strip(" .!?:;«»'\"")
+    if not segment:
+        return []
+    raw_items = extract_tasks_from_phrase(segment)
+    if not raw_items:
+        return []
+    base_clean = (base_title or "").strip()
+    prefix = ""
+    suffix = ""
+    if base_clean:
+        first_raw = raw_items[0].strip()
+        if first_raw:
+            idx = base_clean.lower().rfind(first_raw.lower())
+            if idx != -1:
+                prefix = base_clean[:idx]
+                suffix = base_clean[idx + len(first_raw):]
+
+    def apply_template(raw_value: str) -> str:
+        candidate = raw_value.strip()
+        if prefix or suffix:
+            candidate = f"{prefix}{candidate}{suffix}"
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        return candidate
+
+    tasks: list[str] = []
+    for idx, raw_value in enumerate(raw_items):
+        if idx == 0 and base_clean:
+            candidate = base_clean
+        else:
+            candidate = apply_template(raw_value)
+        if candidate:
+            tasks.append(candidate)
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in tasks:
+        cleaned = item.strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(cleaned)
+    return unique if len(unique) > 1 else []
 
 def split_user_commands(text: str) -> list[str]:
     if not text:
@@ -472,9 +532,69 @@ async def expand_all_lists(update: Update, conn, user_id: int, context: ContextT
     await update.message.reply_text(message, parse_mode="Markdown")
     set_ctx(user_id, last_action="show_lists")
 
+
+def merge_add_task_with_clarify(actions: list, user_id: int, original_text: str) -> list:
+    if not actions:
+        return actions
+    add_indices = [idx for idx, obj in enumerate(actions) if obj.get("action") == "add_task"]
+    if len(add_indices) != 1:
+        return actions
+    add_index = add_indices[0]
+    clarifies_after = [idx for idx in range(add_index + 1, len(actions)) if actions[idx].get("action") == "clarify"]
+    if not clarifies_after:
+        return actions
+    if any(actions[idx].get("action") != "clarify" for idx in range(add_index + 1, len(actions))):
+        return actions
+    base_action = dict(actions[add_index])
+    tasks_field = base_action.get("tasks") if isinstance(base_action.get("tasks"), list) else None
+    base_tasks: list[str] = []
+    if tasks_field:
+        base_tasks = [t for t in tasks_field if isinstance(t, str) and t.strip()]
+    title_field = base_action.get("title")
+    if isinstance(title_field, str) and title_field.strip():
+        if not base_tasks:
+            base_tasks = [title_field.strip()]
+        elif title_field.strip().lower() not in {t.lower() for t in base_tasks}:
+            base_tasks.insert(0, title_field.strip())
+    if not base_tasks:
+        return actions
+    list_name = base_action.get("list") or get_ctx(user_id, "last_list")
+    extracted = extract_task_list_from_command(original_text, list_name, base_tasks[0])
+    if not extracted or len(extracted) <= len(base_tasks):
+        return actions
+    combined: list[str] = []
+    seen: set[str] = set()
+    for task in extracted:
+        cleaned = task.strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key not in seen:
+            seen.add(key)
+            combined.append(cleaned)
+    if len(combined) <= len(base_tasks):
+        return actions
+    base_action["list"] = list_name or base_action.get("list")
+    base_action.pop("title", None)
+    base_action["tasks"] = combined
+    new_actions: list = []
+    for idx, obj in enumerate(actions):
+        if idx == add_index:
+            new_actions.append(base_action)
+        elif idx in clarifies_after:
+            continue
+        else:
+            new_actions.append(obj)
+    logging.info(
+        "Merged add_task with clarifications: %s", json.dumps(base_action, ensure_ascii=False)
+    )
+    return new_actions
+
+
 async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, actions: list, user_id: int, original_text: str) -> list[str]:
     conn = get_conn()
     logging.info(f"Processing actions: {json.dumps(actions)}")
+    actions = merge_add_task_with_clarify(actions, user_id, original_text)
     executed_actions: list[str] = []
     pending_delete = get_ctx(user_id, "pending_delete")
     if original_text.lower() in ["да", "yes"] and pending_delete:
