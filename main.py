@@ -7,6 +7,7 @@ import speech_recognition as sr
 from pydub import AudioSegment
 from openai import OpenAI
 from datetime import datetime, timedelta
+from typing import Any
 from db import (
     rename_list, normalize_text, init_db, get_conn, get_all_lists, get_list_tasks, add_task, delete_list,
     mark_task_done, mark_task_done_fuzzy, delete_task, restore_task, find_list, fetch_task, fetch_list_by_task,
@@ -40,6 +41,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ========= DIALOG CONTEXT (per-user) =========
 SESSION: dict[int, dict] = {}  # { user_id: {"last_action": str, "last_list": str, "history": [str], "pending_delete": str, "pending_confirmation": dict} }
 SIGNIFICANT_ACTIONS = {"create", "add_task", "move_entity", "mark_done", "restore_task", "delete_task", "delete_list"}
+HISTORY_SKIP_ACTIONS = {"show_lists", "show_completed_tasks", "clarify", "confirm"}
 
 LIST_ICON = "📘"
 SECTION_ICON = "📋"
@@ -92,10 +94,12 @@ def set_ctx(user_id: int, **kw):
             "pending_confirmation": None,
         },
     )
-    sess.update({k:v for k,v in kw.items() if v is not None})
-    if "history" in kw and isinstance(kw["history"], list):
-        seen = set()
-        sess["history"] = [x for x in kw["history"][-10:] if not (x in seen or seen.add(x))]
+    for key, value in kw.items():
+        if key == "history" and isinstance(value, list):
+            seen = set()
+            sess["history"] = [x for x in value[-10:] if not (x in seen or seen.add(x))]
+        else:
+            sess[key] = value
     SESSION[user_id] = sess
     logging.info(f"Updated context for user {user_id}: {sess}")
 
@@ -298,6 +302,74 @@ def split_user_commands(text: str) -> list[str]:
 
     return expanded_commands
 
+
+def parse_multi_list_creation(text: str) -> list[str]:
+    if not text:
+        return []
+    pattern = re.compile(r"\bсозда[ййтеь]*\s+списк\w*\b", re.IGNORECASE)
+    match = pattern.search(text)
+    if not match:
+        return []
+    remainder = text[match.end():].strip()
+    if not remainder:
+        return []
+    parts = re.split(r"(?:[,;]|\bи\b)", remainder, flags=re.IGNORECASE)
+    cleaned: list[str] = []
+    for part in parts:
+        chunk = part.strip(" .!?:;«»'\"")
+        if not chunk:
+            continue
+        chunk = re.sub(r"^(?:список|лист)\s+", "", chunk, flags=re.IGNORECASE)
+        chunk = chunk.strip(" .!?:;«»'\"")
+        if chunk:
+            cleaned.append(chunk)
+    seen = set()
+    unique: list[str] = []
+    for item in cleaned:
+        lowered = item.lower()
+        if lowered not in seen:
+            seen.add(lowered)
+            unique.append(item)
+    return unique if len(unique) > 1 else []
+
+
+async def perform_create_list(target: Any, conn, user_id: int, list_name: str, tasks: list[str] | None = None) -> bool:
+    try:
+        logging.info(f"Creating list: {list_name}")
+        create_list(conn, user_id, list_name)
+        action_icon = get_action_icon("create")
+        header = f"{action_icon} Создан новый список {LIST_ICON} *{list_name}*."
+        details = None
+        if tasks:
+            added_tasks: list[str] = []
+            for task in tasks:
+                task_id = add_task(conn, user_id, list_name, task)
+                if task_id:
+                    added_tasks.append(task)
+            if added_tasks:
+                add_icon = get_action_icon("add_task")
+                details = "\n".join(f"{add_icon} {task}" for task in added_tasks)
+            else:
+                details = f"⚠️ Задачи уже были в {LIST_ICON} *{list_name}*."
+        list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *Актуальный список:*")
+        message_obj = getattr(target, "message", None)
+        if message_obj is None:
+            message_obj = target
+        if details:
+            message = f"{header}  \n{details}\n\n{list_block}"
+        else:
+            message = f"{header}  \n\n{list_block}"
+        await message_obj.reply_text(message, parse_mode="Markdown")
+        set_ctx(user_id, last_action="create_list", last_list=list_name)
+        return True
+    except Exception as e:
+        logging.exception(f"Create list error: {e}")
+        message_obj = getattr(target, "message", None)
+        if message_obj is None:
+            message_obj = target
+        await message_obj.reply_text("⚠️ Не удалось создать список. Проверь логи.")
+        return False
+
 def map_tasks_to_lists(conn, user_id: int, task_titles: list[str]) -> dict[str, str]:
     mapping: dict[str, str] = {}
     if not task_titles:
@@ -310,16 +382,16 @@ def map_tasks_to_lists(conn, user_id: int, task_titles: list[str]) -> dict[str, 
                 mapping[original] = list_name
     return mapping
 
-async def handle_pending_confirmation(message, context: ContextTypes.DEFAULT_TYPE, conn, user_id: int, pending_confirmation: dict):
+async def handle_pending_confirmation(message, context: ContextTypes.DEFAULT_TYPE, conn, user_id: int, pending_confirmation: dict) -> bool:
     if not pending_confirmation:
-        return
+        return False
     conf_type = pending_confirmation.get("type")
     if conf_type == "delete_tasks":
         tasks = pending_confirmation.get("tasks") or []
         if not tasks:
             await message.reply_text("⚠️ Нет задач для удаления.")
             set_ctx(user_id, pending_confirmation=None)
-            return
+            return False
         base_list = pending_confirmation.get("list") or get_ctx(user_id, "last_list")
         task_to_list = {task: base_list for task in tasks if base_list}
         if not base_list:
@@ -358,31 +430,25 @@ async def handle_pending_confirmation(message, context: ContextTypes.DEFAULT_TYP
         else:
             await message.reply_text("⚠️ Не удалось обработать удаление задач.")
         set_ctx(user_id, pending_confirmation=None)
+        return bool(deleted_entries)
     elif conf_type == "create_list":
         list_to_create = pending_confirmation.get("list")
         if not list_to_create:
             await message.reply_text("⚠️ Не понимаю, какой список создать.")
             set_ctx(user_id, pending_confirmation=None)
-            return
+            return False
         existing = find_list(conn, user_id, list_to_create)
         if existing:
             await message.reply_text(f"⚠️ Список *{list_to_create}* уже существует.", parse_mode="Markdown")
             set_ctx(user_id, pending_confirmation=None, last_list=list_to_create)
-            return
-        try:
-            create_list(conn, user_id, list_to_create)
-            action_icon = get_action_icon("create")
-            header = f"{action_icon} Создан новый список {LIST_ICON} *{list_to_create}*."
-            list_block = format_list_output(conn, user_id, list_to_create, heading_label=f"{SECTION_ICON} *Актуальный список:*")
-            await message.reply_text(f"{header}  \n\n{list_block}", parse_mode="Markdown")
-            set_ctx(user_id, pending_confirmation=None, last_action="create_list", last_list=list_to_create)
-        except Exception as e:
-            logging.exception(f"Create list via confirmation error: {e}")
-            await message.reply_text("⚠️ Не удалось создать список. Проверь логи.")
-            set_ctx(user_id, pending_confirmation=None)
+            return False
+        handled = await perform_create_list(message, conn, user_id, list_to_create)
+        set_ctx(user_id, pending_confirmation=None)
+        return handled
     else:
         await message.reply_text("⚠️ Не удалось обработать подтверждение. Попробуй сформулировать команду заново.")
         set_ctx(user_id, pending_confirmation=None)
+        return False
 
 async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [["Показать списки", "Создать список"], ["Добавить задачу", "Помощь"]]
@@ -463,35 +529,20 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 entity_type = "task"
                 logging.info(f"Fallback to show_tasks for list: {list_name}")
         if action == "create" and entity_type == "list" and obj.get("list"):
-            try:
-                logging.info(f"Creating list: {obj['list']}")
-                create_list(conn, user_id, obj["list"])
-                if obj.get("tasks"):
-                    added_tasks = []
-                    for t in obj["tasks"]:
-                        task_id = add_task(conn, user_id, obj["list"], t)
-                        if task_id:
-                            added_tasks.append(t)
-                    action_icon = get_action_icon("create")
-                    add_icon = get_action_icon("add_task")
-                    header = f"{action_icon} Создан новый список {LIST_ICON} *{obj['list']}*."
-                    if added_tasks:
-                        details = "\n".join(f"{add_icon} {task}" for task in added_tasks)
-                    else:
-                        details = f"⚠️ Задачи уже были в {LIST_ICON} *{obj['list']}*."
-                    list_block = format_list_output(conn, user_id, obj["list"], heading_label=f"{SECTION_ICON} *Актуальный список:*")
-                    message = f"{header}  \n{details}\n\n{list_block}"
-                    await update.message.reply_text(message, parse_mode="Markdown")
-                else:
-                    action_icon = get_action_icon("create")
-                    header = f"{action_icon} Создан новый список {LIST_ICON} *{obj['list']}*."
-                    list_block = format_list_output(conn, user_id, obj["list"], heading_label=f"{SECTION_ICON} *Актуальный список:*")
-                    await update.message.reply_text(f"{header}  \n\n{list_block}", parse_mode="Markdown")
-                set_ctx(user_id, last_action="create_list", last_list=obj["list"])
+            handled = await perform_create_list(update, conn, user_id, obj["list"], obj.get("tasks"))
+            if handled:
                 executed_actions.append("create")
-            except Exception as e:
-                logging.exception(f"Create list error: {e}")
-                await update.message.reply_text("⚠️ Не удалось создать список. Проверь логи.")
+        elif action == "create_multiple" and entity_type == "list":
+            created_any = False
+            for list_title in obj.get("lists", []) or []:
+                list_clean = (list_title or "").strip()
+                if not list_clean:
+                    continue
+                handled = await perform_create_list(update, conn, user_id, list_clean)
+                if handled:
+                    created_any = True
+            if created_any:
+                executed_actions.append("create")
         elif action == "add_task" and list_name:
             try:
                 logging.info(f"Adding tasks to list: {list_name}")
@@ -1026,6 +1077,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
                         await update.message.reply_text("❎ Отмена.")
                         set_ctx(user_id, pending_confirmation=None)
                 continue
+            multi_lists = parse_multi_list_creation(command_text)
+            if multi_lists:
+                actions = [{"action": "create", "entity_type": "list", "list": name} for name in multi_lists]
+                executed_actions = await route_actions(update, context, actions, user_id, command_text) or []
+                if any(action in SIGNIFICANT_ACTIONS and action not in HISTORY_SKIP_ACTIONS for action in executed_actions):
+                    history = get_ctx(user_id, "history", [])
+                    set_ctx(user_id, history=history + [command_text])
+                continue
             db_state = {
                 "lists": {n: [t for _, t in get_list_tasks(conn, user_id, n)] for n in get_all_lists(conn, user_id)},
                 "last_list": get_ctx(user_id, "last_list"),
@@ -1062,7 +1121,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
                 await send_menu(update, context)
                 continue
             executed_actions = await route_actions(update, context, actions, user_id, command_text) or []
-            if any(action in SIGNIFICANT_ACTIONS for action in executed_actions):
+            if any(action in SIGNIFICANT_ACTIONS and action not in HISTORY_SKIP_ACTIONS for action in executed_actions):
                 history = get_ctx(user_id, "history", [])
                 set_ctx(user_id, history=history + [command_text])
     except Exception as e:
@@ -1135,9 +1194,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "clarify_generic_yes":
             pending_conf = get_ctx(user_id, "pending_confirmation")
             if pending_conf:
-                await handle_pending_confirmation(query.message, context, conn, user_id, pending_conf)
+                handled = await handle_pending_confirmation(query.message, context, conn, user_id, pending_conf)
                 set_ctx(user_id, pending_confirmation=None)
-                await query.edit_message_text("✅ Подтверждение получено.")
+                if handled:
+                    await query.edit_message_text("✅ Подтверждение получено.")
+                else:
+                    await query.edit_message_text("⚠️ Не удалось обработать подтверждение.")
             else:
                 await query.edit_message_text("⚠️ Нет действий для подтверждения.")
         elif data == "clarify_generic_no":
