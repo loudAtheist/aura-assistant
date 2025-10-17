@@ -38,10 +38,19 @@ logging.basicConfig(
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ========= DIALOG CONTEXT (per-user) =========
-SESSION: dict[int, dict] = {}  # { user_id: {"last_action": str, "last_list": str, "history": [str], "pending_delete": str} }
+SESSION: dict[int, dict] = {}  # { user_id: {"last_action": str, "last_list": str, "history": [str], "pending_delete": str, "pending_confirmation": dict} }
 
 def set_ctx(user_id: int, **kw):
-    sess = SESSION.get(user_id, {"history": [], "last_list": None, "last_action": None, "pending_delete": None})
+    sess = SESSION.get(
+        user_id,
+        {
+            "history": [],
+            "last_list": None,
+            "last_action": None,
+            "pending_delete": None,
+            "pending_confirmation": None,
+        },
+    )
     sess.update({k:v for k,v in kw.items() if v is not None})
     if "history" in kw and isinstance(kw["history"], list):
         seen = set()
@@ -50,7 +59,16 @@ def set_ctx(user_id: int, **kw):
     logging.info(f"Updated context for user {user_id}: {sess}")
 
 def get_ctx(user_id: int, key: str, default=None):
-    return SESSION.get(user_id, {"history": [], "last_list": None, "last_action": None, "pending_delete": None}).get(key, default)
+    return SESSION.get(
+        user_id,
+        {
+            "history": [],
+            "last_list": None,
+            "last_action": None,
+            "pending_delete": None,
+            "pending_confirmation": None,
+        },
+    ).get(key, default)
 
 # ========= PROMPT (Semantic Core) =========
 SEMANTIC_PROMPT = """
@@ -154,6 +172,75 @@ def text_mentions_list_and_name(text: str):
         return name
     return None
 
+def extract_tasks_from_question(question: str) -> list[str]:
+    if not question:
+        return []
+    return [m.strip() for m in re.findall(r"'([^']+)'", question)]
+
+def map_tasks_to_lists(conn, user_id: int, task_titles: list[str]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    if not task_titles:
+        return mapping
+    lowered_targets = {title.lower(): title for title in task_titles}
+    for list_name in get_all_lists(conn, user_id):
+        items = [t.lower() for _, t in get_list_tasks(conn, user_id, list_name)]
+        for raw_lower, original in lowered_targets.items():
+            if raw_lower in items and original not in mapping:
+                mapping[original] = list_name
+    return mapping
+
+async def handle_pending_confirmation(message, context: ContextTypes.DEFAULT_TYPE, conn, user_id: int, pending_confirmation: dict):
+    if not pending_confirmation:
+        return
+    conf_type = pending_confirmation.get("type")
+    if conf_type == "delete_tasks":
+        tasks = pending_confirmation.get("tasks") or []
+        if not tasks:
+            await message.reply_text("⚠️ Нет задач для удаления.")
+            set_ctx(user_id, pending_confirmation=None)
+            return
+        base_list = pending_confirmation.get("list") or get_ctx(user_id, "last_list")
+        task_to_list = {task: base_list for task in tasks if base_list}
+        if not base_list:
+            task_to_list.update(map_tasks_to_lists(conn, user_id, tasks))
+        deleted_entries = []
+        failed_entries = []
+        for task in tasks:
+            target_list = task_to_list.get(task)
+            if not target_list:
+                failed_entries.append((None, task))
+                continue
+            deleted, matched = delete_task_fuzzy(conn, user_id, target_list, task)
+            if deleted:
+                deleted_entries.append((target_list, matched or task))
+            else:
+                failed_entries.append((target_list, task))
+        messages = []
+        if deleted_entries:
+            grouped: dict[str, list[str]] = {}
+            for list_name, title in deleted_entries:
+                grouped.setdefault(list_name, []).append(title)
+            parts = [f"*{ln}*: {', '.join(titles)}" for ln, titles in grouped.items()]
+            messages.append("🗑 Удалено: " + "; ".join(parts))
+            last_list_value = deleted_entries[-1][0]
+            set_ctx(user_id, last_action="delete_task", last_list=last_list_value)
+        if failed_entries:
+            parts = []
+            for list_name, title in failed_entries:
+                if list_name:
+                    parts.append(f"*{title}* в *{list_name}*")
+                else:
+                    parts.append(f"*{title}*")
+            messages.append("⚠️ Не удалось удалить: " + ", ".join(parts))
+        if messages:
+            await message.reply_text("\n".join(messages), parse_mode="Markdown")
+        else:
+            await message.reply_text("⚠️ Не удалось обработать удаление задач.")
+        set_ctx(user_id, pending_confirmation=None)
+    else:
+        await message.reply_text("⚠️ Не удалось обработать подтверждение. Попробуй сформулировать команду заново.")
+        set_ctx(user_id, pending_confirmation=None)
+
 async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [["Показать списки", "Создать список"], ["Добавить задачу", "Помощь"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, selective=True)
@@ -210,6 +297,8 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
         logging.info(f"Action: {action}, Entity: {entity_type}, List: {list_name}, Title: {title}")
         if action not in ["delete_list", "clarify"] and get_ctx(user_id, "pending_delete"):
             set_ctx(user_id, pending_delete=None)
+        if action != "clarify" and get_ctx(user_id, "pending_confirmation"):
+            set_ctx(user_id, pending_confirmation=None)
         if list_name == "<последний список>":
             list_name = get_ctx(user_id, "last_list")
             logging.info(f"Resolved placeholder to last_list: {list_name}")
@@ -523,10 +612,40 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
         elif action == "clarify" and meta.get("question"):
             try:
                 logging.info(f"Clarify: {meta['question']}")
-                keyboard = [[InlineKeyboardButton("Да", callback_data=f"clarify_yes:{meta.get('pending')}"), InlineKeyboardButton("Нет", callback_data="clarify_no")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await update.message.reply_text("🤔 " + meta.get("question"), parse_mode="Markdown", reply_markup=reply_markup)
-                set_ctx(user_id, pending_delete=meta.get("pending"))
+                pending = meta.get("pending")
+                if pending:
+                    keyboard = [[
+                        InlineKeyboardButton("Да", callback_data=f"clarify_yes:{pending}"),
+                        InlineKeyboardButton("Нет", callback_data="clarify_no"),
+                    ]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text("🤔 " + meta.get("question"), parse_mode="Markdown", reply_markup=reply_markup)
+                    set_ctx(user_id, pending_delete=pending, pending_confirmation=None)
+                else:
+                    keyboard = [[
+                        InlineKeyboardButton("Да", callback_data="clarify_generic_yes"),
+                        InlineKeyboardButton("Нет", callback_data="clarify_generic_no"),
+                    ]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text("🤔 " + meta.get("question"), parse_mode="Markdown", reply_markup=reply_markup)
+                    confirmation_payload = {
+                        "question": meta.get("question"),
+                        "entity_type": entity_type,
+                        "list": list_name,
+                        "original_text": original_text,
+                    }
+                    question_lower = meta.get("question", "").lower()
+                    if entity_type == "task" and "удал" in question_lower:
+                        tasks_to_handle = extract_tasks_from_question(meta.get("question", ""))
+                        confirmation_payload.update(
+                            {
+                                "type": "delete_tasks",
+                                "tasks": tasks_to_handle,
+                            }
+                        )
+                    else:
+                        confirmation_payload["type"] = "generic"
+                    set_ctx(user_id, pending_confirmation=confirmation_payload)
                 await send_menu(update, context)
             except Exception as e:
                 logging.exception(f"Clarify error: {e}")
@@ -553,12 +672,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
     logging.info(f"📩 Text from {user_id}: {text}")
     try:
         conn = get_conn()
+        history = get_ctx(user_id, "history", [])
+        text_lower = text.lower()
+        pending_delete = get_ctx(user_id, "pending_delete")
+        pending_confirmation = get_ctx(user_id, "pending_confirmation")
+        if text_lower in ["да", "yes", "нет", "no"] and (pending_delete or pending_confirmation):
+            if text_lower in ["да", "yes"]:
+                if pending_delete:
+                    try:
+                        logging.info(f"Deleting list via pending_delete: {pending_delete}")
+                        deleted = delete_list(conn, user_id, pending_delete)
+                        if deleted:
+                            await update.message.reply_text(f"🗑 Список *{pending_delete}* удалён.", parse_mode="Markdown")
+                            set_ctx(user_id, pending_delete=None, pending_confirmation=None, last_list=None)
+                        else:
+                            await update.message.reply_text(f"⚠️ Список *{pending_delete}* не найден.")
+                            set_ctx(user_id, pending_delete=None)
+                    except Exception as e:
+                        logging.exception(f"Delete list error during confirmation: {e}")
+                        await update.message.reply_text("⚠️ Ошибка удаления.")
+                        set_ctx(user_id, pending_delete=None)
+                elif pending_confirmation:
+                    await handle_pending_confirmation(update.message, context, conn, user_id, pending_confirmation)
+            else:
+                if pending_delete:
+                    await update.message.reply_text("Хорошо, отмена удаления.")
+                    set_ctx(user_id, pending_delete=None)
+                if pending_confirmation:
+                    await update.message.reply_text("Хорошо, отмена.")
+                    set_ctx(user_id, pending_confirmation=None)
+            set_ctx(user_id, history=history + [text])
+            return
         db_state = {
             "lists": {n: [t for _, t in get_list_tasks(conn, user_id, n)] for n in get_all_lists(conn, user_id)},
             "last_list": get_ctx(user_id, "last_list"),
             "pending_delete": get_ctx(user_id, "pending_delete")
         }
-        history = get_ctx(user_id, "history", [])
         user_profile = get_user_profile(conn, user_id)
         prompt = SEMANTIC_PROMPT.format(history=json.dumps(history, ensure_ascii=False),
                                        db_state=json.dumps(db_state, ensure_ascii=False),
@@ -653,6 +802,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "clarify_no":
             await query.edit_message_text("Хорошо, отмена удаления.")
             set_ctx(user_id, pending_delete=None)
+        elif data == "clarify_generic_yes":
+            pending_conf = get_ctx(user_id, "pending_confirmation")
+            if pending_conf:
+                await handle_pending_confirmation(query.message, context, get_conn(), user_id, pending_conf)
+                await query.edit_message_text("✅ Подтверждение получено.")
+            else:
+                await query.edit_message_text("⚠️ Нет действий для подтверждения.")
+        elif data == "clarify_generic_no":
+            await query.edit_message_text("Хорошо, отмена.")
+            set_ctx(user_id, pending_confirmation=None)
         else:
             await query.edit_message_text("⚠️ Неизвестная команда.")
     except Exception as e:

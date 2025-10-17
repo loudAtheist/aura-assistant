@@ -1,0 +1,5 @@
+aura.log
+db.sqlite3
+openai_raw.log
+*.pyc
+__pycache__/
