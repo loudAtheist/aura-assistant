@@ -181,8 +181,31 @@ def split_user_commands(text: str) -> list[str]:
     if not text:
         return []
     normalized = text.replace("\r", "\n")
-    parts = re.split(r'(?:[.,;]+|\n+|\bи\b)', normalized, flags=re.IGNORECASE)
-    return [p.strip() for p in parts if p and p.strip()]
+    raw_parts = re.split(r'(?:[.,;]+|\n+|\bи\b)', normalized, flags=re.IGNORECASE)
+    parts = [p.strip() for p in raw_parts if p and p.strip()]
+    commands: list[str] = []
+    last_create_verb: str | None = None
+
+    for part in parts:
+        lower_part = part.lower()
+
+        create_match = re.search(r"\b(созда[ййтеь]*)\b", lower_part)
+        if create_match and re.search(r"\bсписок\b", lower_part):
+            last_create_verb = create_match.group(1)
+            commands.append(part)
+            continue
+
+        if last_create_verb and re.match(r"^(?:список|лист)\b", lower_part):
+            prefix = "создай"
+            if last_create_verb:
+                prefix = last_create_verb
+            commands.append(f"{prefix} {part}")
+            continue
+
+        last_create_verb = None
+        commands.append(part)
+
+    return commands
 
 def map_tasks_to_lists(conn, user_id: int, task_titles: list[str]) -> dict[str, str]:
     mapping: dict[str, str] = {}
