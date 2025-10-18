@@ -1,4 +1,4 @@
-import os, json, re, logging
+import os, json, re, logging, asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
@@ -29,9 +29,19 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 TEMP_DIR = os.getenv("TEMP_DIR", "/opt/aura-assistant/tmp")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN не установлен")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY не установлен")
+
+LOG_DIR = Path(os.getenv("LOG_DIR", "/opt/aura-assistant"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "aura.log"
+RAW_LOG_FILE = LOG_DIR / "openai_raw.log"
+
 # ========= LOG =========
 logging.basicConfig(
-    filename="/opt/aura-assistant/aura.log",
+    filename=str(LOG_FILE),
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -1216,17 +1226,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
                                            user_profile=json.dumps(user_profile, ensure_ascii=False),
                                            pending_delete=get_ctx(user_id, "pending_delete", ""))
             logging.info(f"Sending to OpenAI: {command_text}")
-            resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": command_text}
-                ],
+            resp = await asyncio.to_thread(
+                lambda: client.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": command_text}
+                    ],
+                )
             )
             raw = resp.choices[0].message.content.strip()
             logging.info(f"🤖 RAW: {raw}")
             try:
-                with open("/opt/aura-assistant/openai_raw.log", "a", encoding="utf-8") as f:
+                with open(RAW_LOG_FILE, "a", encoding="utf-8") as f:
                     f.write(f"\n=== RAW ({user_id}) ===\n{command_text}\n{raw}\n")
             except Exception:
                 logging.warning("Failed to write to openai_raw.log")
