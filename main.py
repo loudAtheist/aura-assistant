@@ -140,7 +140,7 @@ SEMANTIC_PROMPT = """
 - Если список запрошен, но отсутствует в db_state.lists — верни clarify с вопросом «Списка *<имя>* нет. Создать?» и meta.pending = «<имя>».
 - Если в запросе несколько задач (например, «добавь постирать ковер помыть машину»), используй ключ tasks для множественного добавления.
 - Если после глагола «добавь» перечислены элементы через запятые или союз «и» (например, «добавь хлеб, молоко и сыр» или «в покупки добавь хлеб, молоко, сыр»), трактуй каждое перечисление как отдельную задачу одного действия add_task. Если список не назван явно, опирайся на db_state.last_list. Не переходи к clarify, когда намерение очевидно.
-- Если в запросе несколько задач для завершения (например, «лук молоко хлеб куплены»), используй ключ tasks для множественного mark_done.
+- Если в запросе несколько задач для завершения (например, «лук, морковь куплены, машина помыта»), верни JSON-ответ с ключом actions, где каждое действие — отдельный mark_done по задаче, и добавь ui_text с кратким резюме выполненного.
 - Если пользователь вводит усечённое слово, но намерение однозначно читается ("спис", "удал", "добав"), интерпретируй его по контексту без дополнительного уточнения.
 - Поиск задач (например, «найди задачи с договор») должен быть регистронезависимым и искать по частичному совпадению.
 - Команда «Покажи удалённые задачи» → action: show_deleted_tasks, entity_type: task.
@@ -174,7 +174,7 @@ SEMANTIC_PROMPT = """
 - Смысл важнее слов: распознавай намерение без триггеров.
 - Контекст: «туда/там/в него» — последний список из истории или db_state.last_list.
 - Позиции: «первую/вторую» — meta.by_index (1…; -1 = последняя).
-- Маркеры завершения («выполнено», «сделано», «куплено») — mark_done с fuzzy-поиском для каждой задачи в tasks.
+- Маркеры завершения («выполнено», «сделано», «куплено») — для каждой найденной задачи формируй отдельное действие mark_done (в массиве actions, если их несколько) и используй fuzzy-поиск.
 - Удаление списка требует подтверждения («да»/«нет»), после «да» список удаляется, контекст очищается.
 - Социальные реплики — action: say.
 - Только JSON.
@@ -183,7 +183,7 @@ SEMANTIC_PROMPT = """
 - «Создай список Работа внеси задачи исправить договор сходить к нотариусу» → {{ "action": "create", "entity_type": "list", "list": "Работа", "tasks": ["Исправить договор", "Сходить к нотариусу"] }}
 - «Создай список Работа и список Домашние дела» → [{{ "action": "create", "entity_type": "list", "list": "Работа" }}, {{ "action": "create", "entity_type": "list", "list": "Домашние дела" }}]
 - «В список Домашние дела добавь постирать ковер помыть машину купить маленький нож» → {{ "action": "add_task", "entity_type": "task", "list": "Домашние дела", "tasks": ["Постирать ковер", "Помыть машину", "Купить маленький нож"] }}
-- «Лук молоко хлеб куплены» → {{ "action": "mark_done", "entity_type": "task", "list": "Домашние дела", "tasks": ["Купить лук", "Купить молоко", "Купить хлеб"], "meta": {{ "fuzzy": true }} }}
+- «Лук, морковь куплены, машина помыта» → {{ "actions": [ {{ "action": "mark_done", "entity_type": "task", "list": "Домашние дела", "title": "Купить лук" }}, {{ "action": "mark_done", "entity_type": "task", "list": "Домашние дела", "title": "Купить морковь" }}, {{ "action": "mark_done", "entity_type": "task", "list": "Домашние дела", "title": "Помыть машину" }} ], "ui_text": "Отмечаю: лук, морковь и машина — выполнено." }}
 - «Переименуй список Покупки в Шопинг» → {{ "action": "rename_list", "entity_type": "list", "list": "Покупки", "title": "Шопинг" }}
 - «Из списка Работа пункт Сделать уборку в гараже Перенеси в Домашние дела» → {{ "action": "move_entity", "entity_type": "task", "title": "Сделать уборку в гараже", "list": "Работа", "to_list": "Домашние дела", "meta": {{ "fuzzy": true }} }}
 - «Сходить к нотариусу выполнен-конец» → {{ "action": "mark_done", "entity_type": "task", "list": "<последний список>", "title": "Сходить к нотариусу" }}
@@ -241,19 +241,45 @@ def extract_tasks_from_question(question: str) -> list[str]:
     return [m.strip() for m in re.findall(r"'([^']+)'", question)]
 
 
+COMPLETION_BASES: dict[str, list[str]] = {
+    "куплен": ["", "а", "о", "ы"],
+    "помыт": ["", "а", "о", "ы", "ый", "ая", "ое", "ые"],
+    "готов": ["", "а", "о", "ы", "ый", "ая", "ое", "ые"],
+    "сделан": ["", "а", "о", "ы", "ный", "ная", "ное", "ные"],
+    "выполнен": ["", "а", "о", "ы", "ный", "ная", "ное", "ные"],
+    "завершен": ["", "а", "о", "ы", "ный", "ная", "ное", "ные"],
+    "завершён": ["", "а", "о", "ы", "ный", "ная", "ное", "ные"],
+    "законч": ["ен", "ена", "ено", "ены"],
+    "приготовлен": ["", "а", "о", "ы"],
+    "сварен": ["", "а", "о", "ы"],
+    "постиран": ["", "а", "о", "ы"],
+    "уложен": ["", "а", "о", "ы"],
+}
+
+COMPLETION_WORDS = sorted({
+    base + suffix
+    for base, suffixes in COMPLETION_BASES.items()
+    for suffix in suffixes
+}, key=len, reverse=True)
+
+COMPLETION_WORD_PATTERN = r"\b(?:" + "|".join(re.escape(word) for word in COMPLETION_WORDS) + r")\b"
+COMPLETION_WORD_REGEX = re.compile(COMPLETION_WORD_PATTERN, re.IGNORECASE)
+COMPLETION_SPLIT_PATTERN = re.compile(r"(?:[,;]|\bи\b|" + COMPLETION_WORD_PATTERN + r")", re.IGNORECASE)
+
+
 def extract_tasks_from_phrase(phrase: str) -> list[str]:
     if not phrase:
         return []
-    split_pattern = r"(?:[,;]|\bи\b|\bкуплен[аоы]?\b|\bкуплены\b|\bготов[аоы]?\b|\bвыполнен[аоы]?\b|\bсделан[аоы]?\b)"
     raw_parts = [
         p.strip()
-        for p in re.split(split_pattern, phrase, flags=re.IGNORECASE)
-        if p and p.strip()
+        for p in COMPLETION_SPLIT_PATTERN.split(phrase)
+        if p and p.strip() and not COMPLETION_WORD_REGEX.fullmatch(p.strip())
     ]
     parts: list[str] = []
     for part in raw_parts:
-        cleaned = re.sub(r"\b(куплен[аоы]?|куплены|готов[аоы]?|выполнен[аоы]?|сделан[аоы]?)\b", " ", part, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = COMPLETION_WORD_REGEX.sub(" ", part)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = cleaned.strip(" .!?:;«»'\"")
         if cleaned:
             parts.append(cleaned)
     unique_parts: list[str] = []
@@ -264,6 +290,156 @@ def extract_tasks_from_phrase(phrase: str) -> list[str]:
             seen.add(lower)
             unique_parts.append(part)
     return unique_parts if len(unique_parts) > 1 else []
+
+
+def parse_completed_task_titles(text: str) -> list[str]:
+    if not text or not COMPLETION_WORD_REGEX.search(text):
+        return []
+    potential_titles: list[str] = []
+    for segment in re.split(r"[.!?]+", text):
+        segment = segment.strip()
+        if not segment or not COMPLETION_WORD_REGEX.search(segment):
+            continue
+        extracted = extract_tasks_from_phrase(segment)
+        if extracted:
+            potential_titles.extend(extracted)
+            continue
+        cleaned = COMPLETION_WORD_REGEX.sub(" ", segment)
+        cleaned = re.sub(r"\b(?:и|а|но|что|же|то|уж)\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = cleaned.strip(" .!?:;«»'\"")
+        if cleaned:
+            potential_titles.append(cleaned)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for title in potential_titles:
+        normalized = title.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(normalized)
+    return unique if len(unique) > 1 else []
+
+
+def format_completion_summary(titles: list[str]) -> str:
+    if not titles:
+        return ""
+    if len(titles) == 1:
+        return f"Отмечаю: {titles[0]} — выполнено."
+    if len(titles) == 2:
+        return f"Отмечаю: {titles[0]} и {titles[1]} — выполнено."
+    return f"Отмечаю: {', '.join(titles[:-1])} и {titles[-1]} — выполнено."
+
+
+def normalize_action_payloads(payloads: list) -> list[dict]:
+    if not payloads:
+        return []
+    normalized: list[dict] = []
+    for obj in payloads:
+        if isinstance(obj, dict) and "actions" in obj and isinstance(obj["actions"], list):
+            for inner in obj["actions"]:
+                if isinstance(inner, dict):
+                    normalized.append(inner)
+            ui_text = obj.get("ui_text")
+            if isinstance(ui_text, str) and ui_text.strip():
+                normalized.append({
+                    "action": "say",
+                    "text": ui_text.strip(),
+                    "meta": {"tone": "friendly", "source": "semantic_summary"},
+                })
+            continue
+        if isinstance(obj, dict):
+            normalized.append(obj)
+    return normalized
+
+
+def _merge_mark_done_buffer(buffer: dict, tasks: list[str], meta: dict | None = None):
+    seen: set[str] = buffer.setdefault("_seen", set())
+    for raw in tasks or []:
+        cleaned = re.sub(r"\s+", " ", (raw or "").strip())
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        buffer.setdefault("tasks", []).append(cleaned)
+    if meta:
+        buffer_meta = buffer.setdefault("meta", {})
+        for m_key, m_value in meta.items():
+            if m_key == "fuzzy":
+                buffer_meta["fuzzy"] = bool(buffer_meta.get("fuzzy") or m_value)
+            elif m_key not in buffer_meta:
+                buffer_meta[m_key] = m_value
+
+
+def collapse_mark_done_actions(actions: list[dict]) -> list[dict]:
+    if not actions:
+        return []
+
+    collapsed: list[dict] = []
+    buffer: dict | None = None
+
+    def flush_buffer():
+        nonlocal buffer
+        if not buffer:
+            return
+        if not buffer.get("tasks"):
+            buffer.pop("_seen", None)
+            collapsed.append(buffer)
+            buffer = None
+            return
+        buffer.pop("_seen", None)
+        if not buffer.get("meta"):
+            buffer.pop("meta", None)
+        collapsed.append(buffer)
+        buffer = None
+
+    for obj in actions:
+        if obj.get("action") != "mark_done":
+            flush_buffer()
+            collapsed.append(obj)
+            continue
+
+        current_tasks: list[str] = []
+        raw_tasks = obj.get("tasks") if isinstance(obj.get("tasks"), list) else []
+        for t in raw_tasks:
+            if isinstance(t, str):
+                current_tasks.append(t)
+        title_value = obj.get("title") or obj.get("task")
+        if isinstance(title_value, str) and title_value.strip():
+            extracted = extract_tasks_from_phrase(title_value)
+            if extracted:
+                current_tasks.extend(extracted)
+            else:
+                current_tasks.append(title_value)
+
+        if not current_tasks:
+            flush_buffer()
+            collapsed.append(obj)
+            continue
+
+        list_name = obj.get("list")
+        entity_type = obj.get("entity_type", "task")
+        meta = obj.get("meta") if isinstance(obj.get("meta"), dict) else {}
+
+        if buffer and buffer.get("list") == list_name and buffer.get("entity_type") == entity_type:
+            _merge_mark_done_buffer(buffer, current_tasks, meta)
+            continue
+
+        flush_buffer()
+        buffer = {
+            "action": "mark_done",
+            "entity_type": entity_type,
+            "list": list_name,
+            "tasks": [],
+        }
+        _merge_mark_done_buffer(buffer, current_tasks, meta)
+
+    flush_buffer()
+    return collapsed
 
 
 def extract_task_list_from_command(command: str, list_name: str | None = None, base_title: str | None = None) -> list[str]:
@@ -604,7 +780,9 @@ def merge_add_task_with_clarify(actions: list, user_id: int, original_text: str)
 async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, actions: list, user_id: int, original_text: str) -> list[str]:
     conn = get_conn()
     logging.info(f"Processing actions: {json.dumps(actions)}")
-    actions = merge_add_task_with_clarify(actions, user_id, original_text)
+    normalized_actions = normalize_action_payloads(actions)
+    normalized_actions = collapse_mark_done_actions(normalized_actions)
+    actions = merge_add_task_with_clarify(normalized_actions, user_id, original_text)
     executed_actions: list[str] = []
     pending_delete = get_ctx(user_id, "pending_delete")
     if original_text.lower() in ["да", "yes"] and pending_delete:
@@ -1211,6 +1389,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
             if multi_lists:
                 actions = [{"action": "create", "entity_type": "list", "list": name} for name in multi_lists]
                 executed_actions = await route_actions(update, context, actions, user_id, command_text) or []
+                if any(action in SIGNIFICANT_ACTIONS and action not in HISTORY_SKIP_ACTIONS for action in executed_actions):
+                    history = get_ctx(user_id, "history", [])
+                    set_ctx(user_id, history=history + [command_text])
+                continue
+            completed_titles = parse_completed_task_titles(command_text)
+            if completed_titles:
+                payload = {
+                    "actions": [
+                        {"action": "mark_done", "entity_type": "task", "title": title}
+                        for title in completed_titles
+                    ]
+                }
+                summary_text = format_completion_summary(completed_titles)
+                if summary_text:
+                    payload["ui_text"] = summary_text
+                executed_actions = await route_actions(update, context, [payload], user_id, command_text) or []
                 if any(action in SIGNIFICANT_ACTIONS and action not in HISTORY_SKIP_ACTIONS for action in executed_actions):
                     history = get_ctx(user_id, "history", [])
                     set_ctx(user_id, history=history + [command_text])
