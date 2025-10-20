@@ -126,15 +126,55 @@ def get_ctx(user_id: int, key: str, default=None):
     ).get(key, default)
 
 # ========= PROMPT (Semantic Core) =========
+SEMANTIC_LEXICON = {
+    "task_synonyms": [
+        "дело",
+        "дела",
+        "задача",
+        "задачи",
+        "пункт",
+        "пункты",
+        "заметка",
+        "заметки",
+        "напоминание",
+        "напоминания",
+        "TODO",
+        "to-do",
+    ],
+    "list_synonyms": [
+        "список",
+        "списки",
+        "лист",
+        "папка",
+        "категория",
+        "проект",
+        "трекер",
+        "блокнот",
+    ],
+    "reminder_verbs": [
+        "напомни",
+        "напомнить",
+        "напоминал",
+        "запомни",
+        "запомнить",
+    ],
+}
+
+SEMANTIC_LEXICON_JSON = json.dumps(SEMANTIC_LEXICON, ensure_ascii=False)
+
 SEMANTIC_PROMPT = """
-Ты — Aura, дружелюбный и остроумный ассистент, который понимает смысл человеческих фраз и управляет локальной Entity System (списки, задачи). Ты ведёшь себя как живой помощник: приветствуешь, поддерживаешь, шутишь к месту, переспрашиваешь, если нужно, и всегда действуешь осмысленно.
+Ты — Aura, дружелюбный и остроумный ассистент, который понимает смысл человеческих фраз и управляет локальной Entity System (списки, задачи, заметки, напоминания). Ты ведёшь себя как живой помощник: приветствуешь, поддерживаешь, шутишь к месту, переспрашиваешь, если нужно, и всегда действуешь осмысленно.
 
 Как ты думаешь:
 - Сначала подумай шаг за шагом: 1) Какое намерение? 2) Какой контекст (последний список, история)? 3) Какое действие выбрать?
-- Учитывай последние сообщения (контекст: {history}) и состояние базы (db_state: {db_state}).
+- Учитывай последние сообщения (контекст: {history}), состояние базы (db_state: {db_state}) и состояние сеанса (session_state: {session_state}).
 - Учитывай профиль пользователя (город, профессия): {user_profile}.
+- Пользуйся семантическим словарём (синонимы сущностей и маркеры намерений): {lexicon}.
 - Если пользователь говорит «туда», «в него», «этот список» — это последний упомянутый список (db_state.last_list или история).
 - Приоритет точного имени списка над контекстом (например, «Домашние дела» важнее last_list).
+- Слова из task_synonyms и reminder_verbs обозначают задачи/заметки/напоминания → entity_type всегда "task" и действие add_task/mark_done/delete_task/... в зависимости от намерения.
+- Слова из list_synonyms обозначают списки. Если пользователь говорит «в этот блокнот» или «в этот проект», используй актуальный список (last_list или уточнённый).
+- Если просит сохранить заметку/напоминание и нет явного списка, используй last_list. Если он отсутствует — уточни, следует ли создать список (например, «Напоминания»).
 - Команда «Покажи список <название>» или «покажи <название>» → показать задачи (action: show_tasks, entity_type: task, list: <название>).
 - Если в одной команде несколько раз встречается «список <имя>» для создания — верни отдельные действия create для каждого списка в одном JSON-массиве.
 - Если список запрошен, но отсутствует в db_state.lists — верни clarify с вопросом «Списка *<имя>* нет. Создать?» и meta.pending = «<имя>».
@@ -266,6 +306,60 @@ COMPLETION_WORD_PATTERN = r"\b(?:" + "|".join(re.escape(word) for word in COMPLE
 COMPLETION_WORD_REGEX = re.compile(COMPLETION_WORD_PATTERN, re.IGNORECASE)
 COMPLETION_SPLIT_PATTERN = re.compile(r"(?:[,;]|\bи\b|" + COMPLETION_WORD_PATTERN + r")", re.IGNORECASE)
 
+TASK_ENTITY_SYNONYMS = {"task", "tasks", "todo", "todos", "note", "notes", "reminder", "reminders", "entry", "item"}
+ACTION_SYNONYM_MAP: dict[str, tuple[str, str | None]] = {
+    "add_note": ("add_task", "task"),
+    "add_notes": ("add_task", "task"),
+    "add_reminder": ("add_task", "task"),
+    "add_reminders": ("add_task", "task"),
+    "create_note": ("add_task", "task"),
+    "create_notes": ("add_task", "task"),
+    "create_reminder": ("add_task", "task"),
+    "create_reminders": ("add_task", "task"),
+    "complete_note": ("mark_done", "task"),
+    "complete_notes": ("mark_done", "task"),
+    "complete_reminder": ("mark_done", "task"),
+    "complete_reminders": ("mark_done", "task"),
+    "finish_note": ("mark_done", "task"),
+    "finish_reminder": ("mark_done", "task"),
+    "delete_note": ("delete_task", "task"),
+    "delete_notes": ("delete_task", "task"),
+    "delete_reminder": ("delete_task", "task"),
+    "delete_reminders": ("delete_task", "task"),
+    "remove_note": ("delete_task", "task"),
+    "remove_reminder": ("delete_task", "task"),
+    "restore_note": ("restore_task", "task"),
+    "restore_notes": ("restore_task", "task"),
+    "restore_reminder": ("restore_task", "task"),
+    "restore_reminders": ("restore_task", "task"),
+    "update_note": ("update_task", "task"),
+    "update_reminder": ("update_task", "task"),
+    "move_note": ("move_entity", "task"),
+    "move_reminder": ("move_entity", "task"),
+    "show_notes": ("show_tasks", "task"),
+    "show_reminders": ("show_tasks", "task"),
+    "list_notes": ("show_tasks", "task"),
+    "list_reminders": ("show_tasks", "task"),
+}
+
+
+def canonicalize_action_dict(obj: dict) -> dict:
+    canonical = dict(obj)
+    action_name = canonical.get("action")
+    if isinstance(action_name, str):
+        lowered = action_name.lower()
+        if lowered in ACTION_SYNONYM_MAP:
+            mapped_action, default_entity = ACTION_SYNONYM_MAP[lowered]
+            canonical["action"] = mapped_action
+            if default_entity and not canonical.get("entity_type"):
+                canonical["entity_type"] = default_entity
+        else:
+            canonical["action"] = lowered
+    entity_type = canonical.get("entity_type")
+    if isinstance(entity_type, str) and entity_type.lower() in TASK_ENTITY_SYNONYMS:
+        canonical["entity_type"] = "task"
+    return canonical
+
 
 def extract_tasks_from_phrase(phrase: str) -> list[str]:
     if not phrase:
@@ -341,7 +435,7 @@ def normalize_action_payloads(payloads: list) -> list[dict]:
         if isinstance(obj, dict) and "actions" in obj and isinstance(obj["actions"], list):
             for inner in obj["actions"]:
                 if isinstance(inner, dict):
-                    normalized.append(inner)
+                    normalized.append(canonicalize_action_dict(inner))
             ui_text = obj.get("ui_text")
             if isinstance(ui_text, str) and ui_text.strip():
                 normalized.append({
@@ -351,7 +445,7 @@ def normalize_action_payloads(payloads: list) -> list[dict]:
                 })
             continue
         if isinstance(obj, dict):
-            normalized.append(obj)
+            normalized.append(canonicalize_action_dict(obj))
     return normalized
 
 
@@ -577,6 +671,52 @@ def parse_multi_list_creation(text: str) -> list[str]:
             seen.add(lowered)
             unique.append(item)
     return unique if len(unique) > 1 else []
+
+
+def build_semantic_state(conn, user_id: int, history: list[str] | None = None) -> tuple[dict, dict]:
+    lists = get_all_lists(conn, user_id)
+    list_tasks: dict[str, list[str]] = {}
+    for name in lists:
+        try:
+            tasks = get_list_tasks(conn, user_id, name)
+        except Exception:
+            tasks = []
+        list_tasks[name] = [title for _, title in tasks[:10]]
+
+    last_list = get_ctx(user_id, "last_list")
+    last_action = get_ctx(user_id, "last_action")
+    pending_delete = get_ctx(user_id, "pending_delete")
+    pending_confirmation = get_ctx(user_id, "pending_confirmation")
+
+    db_state = {
+        "lists": list_tasks,
+        "last_list": last_list,
+        "pending_delete": pending_delete,
+        "total_lists": len(lists),
+        "total_tasks": sum(len(items) for items in list_tasks.values()),
+    }
+
+    session_state: dict[str, Any] = {
+        "last_action": last_action,
+    }
+    if pending_confirmation:
+        session_state["pending_confirmation"] = pending_confirmation
+    if history:
+        session_state["recent_history"] = history[-5:]
+    if last_list:
+        session_state["focus_list"] = {
+            "name": last_list,
+            "tasks": list_tasks.get(last_list, []),
+        }
+
+    recent_tasks = get_all_tasks(conn, user_id)
+    if recent_tasks:
+        session_state["recent_tasks"] = [
+            {"list": list_name, "title": title}
+            for list_name, title in recent_tasks[:10]
+        ]
+
+    return db_state, session_state
 
 
 async def perform_create_list(target: Any, conn, user_id: int, list_name: str, tasks: list[str] | None = None) -> bool:
@@ -1409,15 +1549,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
                     history = get_ctx(user_id, "history", [])
                     set_ctx(user_id, history=history + [command_text])
                 continue
-            db_state = {
-                "lists": {n: [t for _, t in get_list_tasks(conn, user_id, n)] for n in get_all_lists(conn, user_id)},
-                "last_list": get_ctx(user_id, "last_list"),
-                "pending_delete": get_ctx(user_id, "pending_delete")
-            }
+            db_state, session_state = build_semantic_state(conn, user_id, history)
             user_profile = get_user_profile(conn, user_id)
             prompt = SEMANTIC_PROMPT.format(history=json.dumps(history, ensure_ascii=False),
                                            db_state=json.dumps(db_state, ensure_ascii=False),
+                                           session_state=json.dumps(session_state, ensure_ascii=False),
                                            user_profile=json.dumps(user_profile, ensure_ascii=False),
+                                           lexicon=SEMANTIC_LEXICON_JSON,
                                            pending_delete=get_ctx(user_id, "pending_delete", ""))
             logging.info(f"Sending to OpenAI: {command_text}")
             resp = await asyncio.to_thread(
