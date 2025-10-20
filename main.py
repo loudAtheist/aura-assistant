@@ -917,12 +917,102 @@ def merge_add_task_with_clarify(actions: list, user_id: int, original_text: str)
     return new_actions
 
 
+def enrich_add_task_actions(actions: list, user_id: int, original_text: str) -> list:
+    if not actions:
+        return actions
+
+    updated: list[dict] = [dict(obj) if isinstance(obj, dict) else obj for obj in actions]
+    clarifies_to_remove: set[int] = set()
+
+    def collect_base_tasks(obj: dict) -> list[str]:
+        tasks_field = obj.get("tasks") if isinstance(obj.get("tasks"), list) else []
+        candidates: list[str] = []
+        for item in tasks_field:
+            if isinstance(item, str) and item.strip():
+                candidates.append(item.strip())
+        title_field = obj.get("title") or obj.get("task")
+        if isinstance(title_field, str) and title_field.strip():
+            title_clean = title_field.strip()
+            lower_set = {t.lower() for t in candidates}
+            if title_clean.lower() not in lower_set:
+                candidates.append(title_clean)
+        unique: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(candidate)
+        return unique
+
+    for idx, obj in enumerate(updated):
+        if not isinstance(obj, dict) or obj.get("action") != "add_task":
+            continue
+        base_tasks = collect_base_tasks(obj)
+        if not base_tasks:
+            continue
+        list_name = obj.get("list") or get_ctx(user_id, "last_list")
+        extracted = extract_task_list_from_command(original_text, list_name, base_tasks[0])
+        if not extracted:
+            continue
+        combined: list[str] = []
+        seen: set[str] = set()
+        for raw in extracted:
+            cleaned = re.sub(r"\s+", " ", (raw or "").strip())
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(cleaned)
+        if len(combined) <= len(base_tasks):
+            continue
+        obj.pop("title", None)
+        obj["tasks"] = combined
+        # Prepare tokens from additional tasks to suppress redundant clarifications.
+        tokens: set[str] = set()
+        for task in combined[1:]:
+            for token in re.findall(r"[\wё]+", task.lower()):
+                if not token:
+                    continue
+                tokens.add(token)
+                tokens.add(token.rstrip("аеёиоуыэюя"))
+        if not tokens:
+            continue
+        for clar_idx in range(idx + 1, len(updated)):
+            clar_obj = updated[clar_idx]
+            if not isinstance(clar_obj, dict) or clar_obj.get("action") != "clarify":
+                continue
+            question = ""
+            meta = clar_obj.get("meta")
+            if isinstance(meta, dict):
+                question = meta.get("question") or ""
+            question_lower = question.lower()
+            if not question_lower:
+                continue
+            if any(token and token in question_lower for token in tokens):
+                clarifies_to_remove.add(clar_idx)
+
+    if not clarifies_to_remove:
+        return updated
+
+    pruned: list[dict] = []
+    for idx, obj in enumerate(updated):
+        if idx in clarifies_to_remove:
+            continue
+        pruned.append(obj)
+    return pruned
+
+
 async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, actions: list, user_id: int, original_text: str) -> list[str]:
     conn = get_conn()
     logging.info(f"Processing actions: {json.dumps(actions)}")
     normalized_actions = normalize_action_payloads(actions)
     normalized_actions = collapse_mark_done_actions(normalized_actions)
     actions = merge_add_task_with_clarify(normalized_actions, user_id, original_text)
+    actions = enrich_add_task_actions(actions, user_id, original_text)
     executed_actions: list[str] = []
     pending_delete = get_ctx(user_id, "pending_delete")
     if original_text.lower() in ["да", "yes"] and pending_delete:
