@@ -386,6 +386,153 @@ def extract_tasks_from_phrase(phrase: str) -> list[str]:
     return unique_parts if len(unique_parts) > 1 else []
 
 
+
+VERB_BOUNDARY_SUFFIXES = (
+    "ться",
+    "тся",
+    "ись",
+    "йся",
+    "ть",
+    "ти",
+    "йте",
+    "йте",
+    "айте",
+    "яйте",
+    "ите",
+    "ете",
+    "айте",
+    "ай",
+    "яй",
+    "ей",
+    "уй",
+    "ри",
+    "ни",
+)
+
+SHORT_VERB_BOUNDARY_SUFFIXES = {"ай", "яй", "ей", "уй", "ри", "ни"}
+STOPWORD_TOKENS = {
+    "и",
+    "а",
+    "но",
+    "или",
+    "на",
+    "к",
+    "в",
+    "во",
+    "по",
+    "с",
+    "со",
+    "у",
+    "за",
+    "до",
+    "от",
+    "из",
+    "для",
+    "при",
+    "о",
+    "об",
+    "обо",
+    "же",
+    "то",
+}
+
+
+def _token_clean(token: str) -> str:
+    return re.sub(r"\s+", " ", (token or "")).strip(" .!?:;«»'\"")
+
+
+def looks_like_verb_token(token: str) -> bool:
+    cleaned = re.sub(r"[^а-яё-]", "", (token or "").lower())
+    if not cleaned or len(cleaned) < 3:
+        return False
+    for suffix in VERB_BOUNDARY_SUFFIXES:
+        if cleaned.endswith(suffix):
+            if suffix in SHORT_VERB_BOUNDARY_SUFFIXES and len(cleaned) < 4:
+                continue
+            return True
+    return False
+
+
+def guess_enumerated_chunks(segment: str, base_title: str | None = None) -> list[str]:
+    if not segment:
+        return []
+    normalized = re.sub(r"[\r\n]+", " ", segment)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return []
+
+    words = [w for w in re.split(r"\s+", normalized) if w]
+    if len(words) <= 1:
+        return []
+
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for idx, word in enumerate(words):
+        cleaned = _token_clean(word)
+        if not cleaned:
+            continue
+        boundary = idx != 0 and looks_like_verb_token(cleaned)
+        if boundary and current:
+            chunks.append(current)
+            current = []
+        current.append(cleaned)
+    if current:
+        chunks.append(current)
+
+    phrases = [
+        _token_clean(" ".join(chunk))
+        for chunk in chunks
+        if _token_clean(" ".join(chunk))
+    ]
+    if len(phrases) > 1:
+        unique_phrases: list[str] = []
+        seen: set[str] = set()
+        for phrase in phrases:
+            key = phrase.lower()
+            if key not in seen:
+                seen.add(key)
+                unique_phrases.append(phrase)
+        if len(unique_phrases) > 1:
+            return unique_phrases
+
+    filtered_words = [
+        _token_clean(word)
+        for word in words
+        if _token_clean(word) and _token_clean(word).lower() not in STOPWORD_TOKENS
+    ]
+    if base_title:
+        if (
+            len(filtered_words) > 1
+            and all(" " not in token for token in filtered_words)
+            and sum(1 for token in filtered_words if not looks_like_verb_token(token)) >= 2
+        ):
+            unique_simple: list[str] = []
+            seen_simple: set[str] = set()
+            for token in filtered_words:
+                key = token.lower()
+                if key not in seen_simple:
+                    seen_simple.add(key)
+                    unique_simple.append(token)
+            if len(unique_simple) > 1:
+                return unique_simple
+    else:
+        if (
+            len(filtered_words) > 2
+            and all(" " not in token for token in filtered_words)
+            and sum(1 for token in filtered_words if not looks_like_verb_token(token)) >= 2
+        ):
+            unique_simple: list[str] = []
+            seen_simple: set[str] = set()
+            for token in filtered_words:
+                key = token.lower()
+                if key not in seen_simple:
+                    seen_simple.add(key)
+                    unique_simple.append(token)
+            if len(unique_simple) > 1:
+                return unique_simple
+    return []
+
+
 def parse_completed_task_titles(text: str) -> list[str]:
     if not text or not COMPLETION_WORD_REGEX.search(text):
         return []
@@ -552,10 +699,12 @@ def extract_task_list_from_command(command: str, list_name: str | None = None, b
     segment = segment.strip(" .!?:;«»'\"")
     if not segment:
         return []
+    base_clean = (base_title or "").strip()
     raw_items = extract_tasks_from_phrase(segment)
     if not raw_items:
+        raw_items = guess_enumerated_chunks(segment, base_clean or None)
+    if not raw_items:
         return []
-    base_clean = (base_title or "").strip()
     prefix = ""
     suffix = ""
     if base_clean:
@@ -566,11 +715,15 @@ def extract_task_list_from_command(command: str, list_name: str | None = None, b
                 prefix = base_clean[:idx]
                 suffix = base_clean[idx + len(first_raw):]
 
+    should_capitalize = bool(base_clean[:1].isupper())
+
     def apply_template(raw_value: str) -> str:
         candidate = raw_value.strip()
         if prefix or suffix:
             candidate = f"{prefix}{candidate}{suffix}"
         candidate = re.sub(r"\s+", " ", candidate).strip()
+        if should_capitalize and candidate and candidate[0].islower():
+            candidate = candidate[0].upper() + candidate[1:]
         return candidate
 
     tasks: list[str] = []
