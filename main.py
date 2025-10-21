@@ -6,6 +6,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandle
 import speech_recognition as sr
 from pydub import AudioSegment
 from openai import OpenAI
+from openai import AuthenticationError
 from datetime import datetime, timedelta
 from typing import Any
 from db import (
@@ -169,6 +170,14 @@ SEMANTIC_LEXICON = {
     ],
 }
 SEMANTIC_LEXICON_JSON = json.dumps(SEMANTIC_LEXICON, ensure_ascii=False)
+class _PromptValues(dict):
+    """Helper for safe string formatting of SEMANTIC_PROMPT."""
+
+    def __missing__(self, key: str) -> str:
+        logger.warning("Missing placeholder '%s' while rendering prompt", key)
+        return ""
+
+
 SEMANTIC_PROMPT = """
 Ты — Aura, дружелюбный и остроумный ассистент, который понимает смысл человеческих фраз и управляет локальной Entity System (списки, задачи, заметки, напоминания). Ты ведёшь себя как живой помощник: приветствуешь, поддерживаешь, шутишь к месту, переспрашиваешь, если нужно, и всегда действуешь осмысленно.
 Как ты думаешь:
@@ -1392,7 +1401,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
         history = get_ctx(user_id, "history", [])
         db_state, session_state = build_semantic_state(conn, user_id, history)
         user_profile = get_user_profile(conn, user_id)
-        prompt = SEMANTIC_PROMPT.format(
+        prompt_values = _PromptValues(
             history=json.dumps(history, ensure_ascii=False),
             db_state=json.dumps(db_state, ensure_ascii=False),
             session_state=json.dumps(session_state, ensure_ascii=False),
@@ -1400,14 +1409,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
             lexicon=SEMANTIC_LEXICON_JSON,
             pending_delete=get_ctx(user_id, "pending_delete", ""),
         )
+        prompt = SEMANTIC_PROMPT.format_map(prompt_values)
         logger.info(f"Sending to OpenAI: {text}")
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": text}
-            ],
-        )
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": text}
+                ],
+            )
+        except AuthenticationError as auth_error:
+            logger.error("OpenAI authentication failed: %s", auth_error)
+            await update.message.reply_text(
+                "⚠️ Ошибка авторизации OpenAI. Проверь API-ключ.")
+            return
         raw = resp.choices[0].message.content.strip()
         logger.info(f"🤖 RAW: {raw}")
         try:
