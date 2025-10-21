@@ -1389,17 +1389,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
     logger.info(f"📩 Text from {user_id}: {text}")
     try:
         conn = get_conn()
-        db_state = {
-            "lists": {n: [t for _, t in get_list_tasks(conn, user_id, n)] for n in get_all_lists(conn, user_id)},
-            "last_list": get_ctx(user_id, "last_list"),
-            "pending_delete": get_ctx(user_id, "pending_delete")
-        }
         history = get_ctx(user_id, "history", [])
+        db_state, session_state = build_semantic_state(conn, user_id, history)
         user_profile = get_user_profile(conn, user_id)
-        prompt = SEMANTIC_PROMPT.format(history=json.dumps(history, ensure_ascii=False), 
-                                       db_state=json.dumps(db_state, ensure_ascii=False),
-                                       user_profile=json.dumps(user_profile, ensure_ascii=False),
-                                       pending_delete=get_ctx(user_id, "pending_delete", ""))
+        prompt = SEMANTIC_PROMPT.format(
+            history=json.dumps(history, ensure_ascii=False),
+            db_state=json.dumps(db_state, ensure_ascii=False),
+            session_state=json.dumps(session_state, ensure_ascii=False),
+            user_profile=json.dumps(user_profile, ensure_ascii=False),
+            lexicon=SEMANTIC_LEXICON_JSON,
+            pending_delete=get_ctx(user_id, "pending_delete", ""),
+        )
         logger.info(f"Sending to OpenAI: {text}")
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
