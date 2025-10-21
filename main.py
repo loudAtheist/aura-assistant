@@ -14,7 +14,6 @@ from db import (
     delete_task_fuzzy, delete_task_by_index, create_list, move_entity, get_all_tasks, update_user_profile,
     get_user_profile, get_completed_tasks, get_deleted_tasks, search_tasks, update_task, update_task_by_index, restore_task_fuzzy
 )
-
 # ========= ENV =========
 dotenv_path = Path(__file__).resolve().parent / ".env"
 if dotenv_path.exists():
@@ -22,41 +21,33 @@ if dotenv_path.exists():
     print(f"[INFO] .env loaded from {dotenv_path}")
 else:
     print(f"[WARNING] .env not found at {dotenv_path}")
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 TEMP_DIR = os.getenv("TEMP_DIR", "/opt/aura-assistant/tmp")
 os.makedirs(TEMP_DIR, exist_ok=True)
-
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN не установлен")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY не установлен")
-
 LOG_DIR = Path(os.getenv("LOG_DIR", "/opt/aura-assistant"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "aura.log"
 RAW_LOG_FILE = LOG_DIR / "openai_raw.log"
-
 # ========= LOG =========
 logging.basicConfig(
     filename=str(LOG_FILE),
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-
 client = OpenAI(api_key=OPENAI_API_KEY)
-
 # ========= DIALOG CONTEXT (per-user) =========
-SESSION: dict[int, dict] = {}  # { user_id: {"last_action": str, "last_list": str, "history": [str], "pending_delete": str, "pending_confirmation": dict} }
+SESSION: dict[int, dict] = {} # { user_id: {"last_action": str, "last_list": str, "history": [str], "pending_delete": str, "pending_confirmation": dict} }
 SIGNIFICANT_ACTIONS = {"create", "add_task", "move_entity", "mark_done", "restore_task", "delete_task", "delete_list"}
 HISTORY_SKIP_ACTIONS = {"show_lists", "show_completed_tasks", "clarify", "confirm"}
-
 LIST_ICON = "📘"
 SECTION_ICON = "📋"
 ALL_LISTS_ICON = "🗂"
-
 ACTION_ICONS = {
     "add_task": "🟢",
     "create": "📘",
@@ -69,12 +60,8 @@ ACTION_ICONS = {
     "update_task": "🔄",
     "update_profile": "🆙",
 }
-
-
 def get_action_icon(action: str) -> str:
     return ACTION_ICONS.get(action, "✨")
-
-
 def format_list_output(conn, user_id: int, list_name: str, heading_label: str | None = None) -> str:
     heading = heading_label or f"{SECTION_ICON} *{list_name}:*"
     tasks = get_list_tasks(conn, user_id, list_name)
@@ -82,17 +69,14 @@ def format_list_output(conn, user_id: int, list_name: str, heading_label: str | 
         lines = [f"{idx}. {title}" for idx, title in tasks]
     else:
         lines = ["_— пусто —_"]
-    return f"{heading}  \n" + "\n".join(lines)
-
-
+    return f"{heading} \n" + "\n".join(lines)
 def show_all_lists(conn, user_id: int, heading_label: str | None = None) -> str:
     heading = heading_label or f"{ALL_LISTS_ICON} *Твои списки:*"
     lists = get_all_lists(conn, user_id)
     if not lists:
-        return f"{heading}  \n_— пусто —_"
+        return f"{heading} \n_— пусто —_"
     body = "\n".join(f"{SECTION_ICON} {name}" for name in lists)
-    return f"{heading}  \n{body}"
-
+    return f"{heading} \n{body}"
 def set_ctx(user_id: int, **kw):
     sess = SESSION.get(
         user_id,
@@ -112,7 +96,6 @@ def set_ctx(user_id: int, **kw):
             sess[key] = value
     SESSION[user_id] = sess
     logging.info(f"Updated context for user {user_id}: {sess}")
-
 def get_ctx(user_id: int, key: str, default=None):
     return SESSION.get(
         user_id,
@@ -124,7 +107,6 @@ def get_ctx(user_id: int, key: str, default=None):
             "pending_confirmation": None,
         },
     ).get(key, default)
-
 # ========= PROMPT (Semantic Core) =========
 SEMANTIC_LEXICON = {
     "task_synonyms": [
@@ -159,12 +141,9 @@ SEMANTIC_LEXICON = {
         "запомнить",
     ],
 }
-
 SEMANTIC_LEXICON_JSON = json.dumps(SEMANTIC_LEXICON, ensure_ascii=False)
-
 SEMANTIC_PROMPT = """
 Ты — Aura, дружелюбный и остроумный ассистент, который понимает смысл человеческих фраз и управляет локальной Entity System (списки, задачи, заметки, напоминания). Ты ведёшь себя как живой помощник: приветствуешь, поддерживаешь, шутишь к месту, переспрашиваешь, если нужно, и всегда действуешь осмысленно.
-
 Как ты думаешь:
 - Сначала подумай шаг за шагом: 1) Какое намерение? 2) Какой контекст (последний список, история)? 3) Какое действие выбрать?
 - Учитывай последние сообщения (контекст: {history}), состояние базы (db_state: {db_state}) и состояние сеанса (session_state: {session_state}).
@@ -176,10 +155,8 @@ SEMANTIC_PROMPT = """
 - Слова из list_synonyms обозначают списки. Если пользователь говорит «в этот блокнот» или «в этот проект», используй актуальный список (last_list или уточнённый).
 - Если просит сохранить заметку/напоминание и нет явного списка, используй last_list. Если он отсутствует — уточни, следует ли создать список (например, «Напоминания»).
 - Команда «Покажи список <название>» или «покажи <название>» → показать задачи (action: show_tasks, entity_type: task, list: <название>).
-- Если в одной команде несколько раз встречается «список <имя>» для создания — верни отдельные действия create для каждого списка в одном JSON-массиве.
+- Если в одной команде несколько задач (например, «добавь постирать ковер, помыть машину, купить нож» или «добавь постирать ковер помыть машину»), всегда возвращай одно действие add_task с массивом tasks, содержащим все задачи. Запятые, пробелы или союз «и» обозначают отдельные задачи. Не генерируй clarify для задач в одной команде.
 - Если список запрошен, но отсутствует в db_state.lists — верни clarify с вопросом «Списка *<имя>* нет. Создать?» и meta.pending = «<имя>».
-- Если в запросе несколько задач (например, «добавь постирать ковер помыть машину»), используй ключ tasks для множественного добавления.
-- Если после глагола «добавь» перечислены элементы через запятые или союз «и» (например, «добавь хлеб, молоко и сыр» или «в покупки добавь хлеб, молоко, сыр»), трактуй каждое перечисление как отдельную задачу одного действия add_task. Если список не назван явно, опирайся на db_state.last_list. Не переходи к clarify, когда намерение очевидно.
 - Если в запросе несколько задач для завершения (например, «лук, морковь куплены, машина помыта»), верни JSON-ответ с ключом actions, где каждое действие — отдельный mark_done по задаче, и добавь ui_text с кратким резюме выполненного.
 - Если пользователь вводит усечённое слово, но намерение однозначно читается ("спис", "удал", "добав"), интерпретируй его по контексту без дополнительного уточнения.
 - Поиск задач (например, «найди задачи с договор») должен быть регистронезависимым и искать по частичному совпадению.
@@ -195,7 +172,6 @@ SEMANTIC_PROMPT = """
 - Для удаления списка всегда используй clarify сначала: {{ "action": "clarify", "meta": {{ "question": "Уверен, что хочешь удалить список {pending_delete}? Скажи 'да' или 'нет'.", "pending": "{pending_delete}" }} }}
 - Если команда «да» и есть pending_delete в контексте, возвращай: {{ "action": "delete_list", "entity_type": "list", "list": "{pending_delete}" }}
 - Никогда не обрезай JSON. Всегда полный объект.
-
 Формат ответа (строго JSON; без текста вне JSON):
 - Для действий над базой:
 {{ "action": "create|add_task|show_lists|show_tasks|show_all_tasks|mark_done|delete_task|delete_list|move_entity|search_entity|rename_list|update_profile|restore_task|show_completed_tasks|show_deleted_tasks|update_task|unknown",
@@ -209,7 +185,6 @@ SEMANTIC_PROMPT = """
 {{ "action": "say", "text": "короткий дружелюбный ответ", "meta": {{ "tone": "friendly", "context_used": true }} }}
 - Для уточнения:
 {{ "action": "clarify", "meta": {{ "question": "вежливый уточняющий вопрос", "context_used": true }} }}
-
 Правила поведения:
 - Смысл важнее слов: распознавай намерение без триггеров.
 - Контекст: «туда/там/в него» — последний список из истории или db_state.last_list.
@@ -218,11 +193,10 @@ SEMANTIC_PROMPT = """
 - Удаление списка требует подтверждения («да»/«нет»), после «да» список удаляется, контекст очищается.
 - Социальные реплики — action: say.
 - Только JSON.
-
 Примеры:
 - «Создай список Работа внеси задачи исправить договор сходить к нотариусу» → {{ "action": "create", "entity_type": "list", "list": "Работа", "tasks": ["Исправить договор", "Сходить к нотариусу"] }}
 - «Создай список Работа и список Домашние дела» → [{{ "action": "create", "entity_type": "list", "list": "Работа" }}, {{ "action": "create", "entity_type": "list", "list": "Домашние дела" }}]
-- «В список Домашние дела добавь постирать ковер помыть машину купить маленький нож» → {{ "action": "add_task", "entity_type": "task", "list": "Домашние дела", "tasks": ["Постирать ковер", "Помыть машину", "Купить маленький нож"] }}
+- «В список Домашние дела добавь постирать ковер, помыть машину, купить маленький нож» → {{ "action": "add_task", "entity_type": "task", "list": "Домашние дела", "tasks": ["Постирать ковер", "Помыть машину", "Купить маленький нож"] }}
 - «Лук, морковь куплены, машина помыта» → {{ "actions": [ {{ "action": "mark_done", "entity_type": "task", "list": "Домашние дела", "title": "Купить лук" }}, {{ "action": "mark_done", "entity_type": "task", "list": "Домашние дела", "title": "Купить морковь" }}, {{ "action": "mark_done", "entity_type": "task", "list": "Домашние дела", "title": "Помыть машину" }} ], "ui_text": "Отмечаю: лук, морковь и машина — выполнено." }}
 - «Переименуй список Покупки в Шопинг» → {{ "action": "rename_list", "entity_type": "list", "list": "Покупки", "title": "Шопинг" }}
 - «Из списка Работа пункт Сделать уборку в гараже Перенеси в Домашние дела» → {{ "action": "move_entity", "entity_type": "task", "title": "Сделать уборку в гараже", "list": "Работа", "to_list": "Домашние дела", "meta": {{ "fuzzy": true }} }}
@@ -239,7 +213,6 @@ SEMANTIC_PROMPT = """
 - «Да» (после удаления списка) → {{ "action": "delete_list", "entity_type": "list", "list": "{pending_delete}" }}
 - «Измени четвёртый пункт в списке Работа на Проверить баги» → {{ "action": "update_task", "entity_type": "task", "list": "Работа", "meta": {{ "by_index": 4, "new_title": "Проверить баги" }} }}
 """
-
 # ========= Helpers =========
 def extract_json_blocks(s: str):
     try:
@@ -264,23 +237,18 @@ def extract_json_blocks(s: str):
         except Exception:
             logging.warning(f"Skip invalid JSON block: {b[:120]}")
     return out
-
 def wants_expand(text: str) -> bool:
     return bool(re.search(r'\b(разверну|подробн)\w*', (text or "").lower()))
-
 def text_mentions_list_and_name(text: str):
     m = re.search(r'(?:список|лист)\s+([^\n\r]+)$', (text or "").strip(), re.IGNORECASE)
     if m:
         name = m.group(1).strip(" .!?:;«»'\"").strip()
         return name
     return None
-
 def extract_tasks_from_question(question: str) -> list[str]:
     if not question:
         return []
     return [m.strip() for m in re.findall(r"'([^']+)'", question)]
-
-
 COMPLETION_BASES: dict[str, list[str]] = {
     "куплен": ["", "а", "о", "ы"],
     "помыт": ["", "а", "о", "ы", "ый", "ая", "ое", "ые"],
@@ -295,17 +263,14 @@ COMPLETION_BASES: dict[str, list[str]] = {
     "постиран": ["", "а", "о", "ы"],
     "уложен": ["", "а", "о", "ы"],
 }
-
 COMPLETION_WORDS = sorted({
     base + suffix
     for base, suffixes in COMPLETION_BASES.items()
     for suffix in suffixes
 }, key=len, reverse=True)
-
 COMPLETION_WORD_PATTERN = r"\b(?:" + "|".join(re.escape(word) for word in COMPLETION_WORDS) + r")\b"
 COMPLETION_WORD_REGEX = re.compile(COMPLETION_WORD_PATTERN, re.IGNORECASE)
 COMPLETION_SPLIT_PATTERN = re.compile(r"(?:[,;]|\bи\b|" + COMPLETION_WORD_PATTERN + r")", re.IGNORECASE)
-
 TASK_ENTITY_SYNONYMS = {"task", "tasks", "todo", "todos", "note", "notes", "reminder", "reminders", "entry", "item"}
 ACTION_SYNONYM_MAP: dict[str, tuple[str, str | None]] = {
     "add_note": ("add_task", "task"),
@@ -341,8 +306,6 @@ ACTION_SYNONYM_MAP: dict[str, tuple[str, str | None]] = {
     "list_notes": ("show_tasks", "task"),
     "list_reminders": ("show_tasks", "task"),
 }
-
-
 def canonicalize_action_dict(obj: dict) -> dict:
     canonical = dict(obj)
     action_name = canonical.get("action")
@@ -359,8 +322,6 @@ def canonicalize_action_dict(obj: dict) -> dict:
     if isinstance(entity_type, str) and entity_type.lower() in TASK_ENTITY_SYNONYMS:
         canonical["entity_type"] = "task"
     return canonical
-
-
 def extract_tasks_from_phrase(phrase: str) -> list[str]:
     if not phrase:
         return []
@@ -384,23 +345,18 @@ def extract_tasks_from_phrase(phrase: str) -> list[str]:
             seen.add(lower)
             unique_parts.append(part)
     return unique_parts if len(unique_parts) > 1 else []
-
-
-
 VERB_BOUNDARY_SUFFIXES = (
     "ться",
-    "тся",
+    "тса",
     "ись",
     "йся",
     "ть",
     "ти",
     "йте",
-    "йте",
     "айте",
     "яйте",
     "ите",
     "ете",
-    "айте",
     "ай",
     "яй",
     "ей",
@@ -408,7 +364,6 @@ VERB_BOUNDARY_SUFFIXES = (
     "ри",
     "ни",
 )
-
 SHORT_VERB_BOUNDARY_SUFFIXES = {"ай", "яй", "ей", "уй", "ри", "ни"}
 STOPWORD_TOKENS = {
     "и",
@@ -435,12 +390,8 @@ STOPWORD_TOKENS = {
     "же",
     "то",
 }
-
-
 def _token_clean(token: str) -> str:
     return re.sub(r"\s+", " ", (token or "")).strip(" .!?:;«»'\"")
-
-
 def looks_like_verb_token(token: str) -> bool:
     cleaned = re.sub(r"[^а-яё-]", "", (token or "").lower())
     if not cleaned or len(cleaned) < 3:
@@ -451,8 +402,6 @@ def looks_like_verb_token(token: str) -> bool:
                 continue
             return True
     return False
-
-
 def guess_enumerated_chunks(segment: str, base_title: str | None = None) -> list[str]:
     if not segment:
         return []
@@ -460,11 +409,9 @@ def guess_enumerated_chunks(segment: str, base_title: str | None = None) -> list
     normalized = re.sub(r"\s+", " ", normalized).strip()
     if not normalized:
         return []
-
     words = [w for w in re.split(r"\s+", normalized) if w]
     if len(words) <= 1:
         return []
-
     chunks: list[list[str]] = []
     current: list[str] = []
     for idx, word in enumerate(words):
@@ -478,7 +425,6 @@ def guess_enumerated_chunks(segment: str, base_title: str | None = None) -> list
         current.append(cleaned)
     if current:
         chunks.append(current)
-
     phrases = [
         _token_clean(" ".join(chunk))
         for chunk in chunks
@@ -494,7 +440,6 @@ def guess_enumerated_chunks(segment: str, base_title: str | None = None) -> list
                 unique_phrases.append(phrase)
         if len(unique_phrases) > 1:
             return unique_phrases
-
     filtered_words = [
         _token_clean(word)
         for word in words
@@ -531,8 +476,6 @@ def guess_enumerated_chunks(segment: str, base_title: str | None = None) -> list
             if len(unique_simple) > 1:
                 return unique_simple
     return []
-
-
 def parse_completed_task_titles(text: str) -> list[str]:
     if not text or not COMPLETION_WORD_REGEX.search(text):
         return []
@@ -562,8 +505,6 @@ def parse_completed_task_titles(text: str) -> list[str]:
             seen.add(key)
             unique.append(normalized)
     return unique if len(unique) > 1 else []
-
-
 def format_completion_summary(titles: list[str]) -> str:
     if not titles:
         return ""
@@ -572,8 +513,6 @@ def format_completion_summary(titles: list[str]) -> str:
     if len(titles) == 2:
         return f"Отмечаю: {titles[0]} и {titles[1]} — выполнено."
     return f"Отмечаю: {', '.join(titles[:-1])} и {titles[-1]} — выполнено."
-
-
 def normalize_action_payloads(payloads: list) -> list[dict]:
     if not payloads:
         return []
@@ -594,35 +533,11 @@ def normalize_action_payloads(payloads: list) -> list[dict]:
         if isinstance(obj, dict):
             normalized.append(canonicalize_action_dict(obj))
     return normalized
-
-
-def _merge_mark_done_buffer(buffer: dict, tasks: list[str], meta: dict | None = None):
-    seen: set[str] = buffer.setdefault("_seen", set())
-    for raw in tasks or []:
-        cleaned = re.sub(r"\s+", " ", (raw or "").strip())
-        if not cleaned:
-            continue
-        key = cleaned.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        buffer.setdefault("tasks", []).append(cleaned)
-    if meta:
-        buffer_meta = buffer.setdefault("meta", {})
-        for m_key, m_value in meta.items():
-            if m_key == "fuzzy":
-                buffer_meta["fuzzy"] = bool(buffer_meta.get("fuzzy") or m_value)
-            elif m_key not in buffer_meta:
-                buffer_meta[m_key] = m_value
-
-
 def collapse_mark_done_actions(actions: list[dict]) -> list[dict]:
     if not actions:
         return []
-
     collapsed: list[dict] = []
     buffer: dict | None = None
-
     def flush_buffer():
         nonlocal buffer
         if not buffer:
@@ -637,13 +552,11 @@ def collapse_mark_done_actions(actions: list[dict]) -> list[dict]:
             buffer.pop("meta", None)
         collapsed.append(buffer)
         buffer = None
-
     for obj in actions:
         if obj.get("action") != "mark_done":
             flush_buffer()
             collapsed.append(obj)
             continue
-
         current_tasks: list[str] = []
         raw_tasks = obj.get("tasks") if isinstance(obj.get("tasks"), list) else []
         for t in raw_tasks:
@@ -656,33 +569,54 @@ def collapse_mark_done_actions(actions: list[dict]) -> list[dict]:
                 current_tasks.extend(extracted)
             else:
                 current_tasks.append(title_value)
-
         if not current_tasks:
             flush_buffer()
             collapsed.append(obj)
             continue
-
         list_name = obj.get("list")
         entity_type = obj.get("entity_type", "task")
         meta = obj.get("meta") if isinstance(obj.get("meta"), dict) else {}
-
         if buffer and buffer.get("list") == list_name and buffer.get("entity_type") == entity_type:
-            _merge_mark_done_buffer(buffer, current_tasks, meta)
+            seen = buffer.setdefault("_seen", set())
+            for raw in current_tasks or []:
+                cleaned = re.sub(r"\s+", " ", (raw or "").strip())
+                if not cleaned:
+                    continue
+                key = cleaned.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                buffer.setdefault("tasks", []).append(cleaned)
+            if meta:
+                buffer_meta = buffer.setdefault("meta", {})
+                for m_key, m_value in meta.items():
+                    if m_key == "fuzzy":
+                        buffer_meta["fuzzy"] = bool(buffer_meta.get("fuzzy") or m_value)
+                    elif m_key not in buffer_meta:
+                        buffer_meta[m_key] = m_value
             continue
-
         flush_buffer()
         buffer = {
             "action": "mark_done",
             "entity_type": entity_type,
             "list": list_name,
             "tasks": [],
+            "_seen": set(),
         }
-        _merge_mark_done_buffer(buffer, current_tasks, meta)
-
+        seen = buffer["_seen"]
+        for raw in current_tasks or []:
+            cleaned = re.sub(r"\s+", " ", (raw or "").strip())
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            buffer["tasks"].append(cleaned)
+        if meta:
+            buffer["meta"] = meta
     flush_buffer()
     return collapsed
-
-
 def extract_task_list_from_command(command: str, list_name: str | None = None, base_title: str | None = None) -> list[str]:
     if not command:
         return []
@@ -699,54 +633,18 @@ def extract_task_list_from_command(command: str, list_name: str | None = None, b
     segment = segment.strip(" .!?:;«»'\"")
     if not segment:
         return []
-    base_clean = (base_title or "").strip()
-    raw_items = extract_tasks_from_phrase(segment)
-    if not raw_items:
-        raw_items = guess_enumerated_chunks(segment, base_clean or None)
-    if not raw_items:
-        return []
-    prefix = ""
-    suffix = ""
-    if base_clean:
-        first_raw = raw_items[0].strip()
-        if first_raw:
-            idx = base_clean.lower().rfind(first_raw.lower())
-            if idx != -1:
-                prefix = base_clean[:idx]
-                suffix = base_clean[idx + len(first_raw):]
-
-    should_capitalize = bool(base_clean[:1].isupper())
-
-    def apply_template(raw_value: str) -> str:
-        candidate = raw_value.strip()
-        if prefix or suffix:
-            candidate = f"{prefix}{candidate}{suffix}"
-        candidate = re.sub(r"\s+", " ", candidate).strip()
-        if should_capitalize and candidate and candidate[0].islower():
-            candidate = candidate[0].upper() + candidate[1:]
-        return candidate
-
-    tasks: list[str] = []
-    for idx, raw_value in enumerate(raw_items):
-        if idx == 0 and base_clean:
-            candidate = base_clean
-        else:
-            candidate = apply_template(raw_value)
-        if candidate:
-            tasks.append(candidate)
-
-    unique: list[str] = []
-    seen: set[str] = set()
-    for item in tasks:
-        cleaned = item.strip()
-        if not cleaned:
+    raw_items = re.split(r"(?:[,;]|\bи\b)", segment, flags=re.IGNORECASE)
+    tasks = [item.strip(" .!?:;«»'\"") for item in raw_items if item.strip(" .!?:;«»'\"")]
+    unique = []
+    seen = set()
+    for task in tasks:
+        if not task:
             continue
-        key = cleaned.lower()
+        key = task.lower()
         if key not in seen:
             seen.add(key)
-            unique.append(cleaned)
-    return unique if len(unique) > 1 else []
-
+            unique.append(task)
+    return unique
 def split_user_commands(text: str) -> list[str]:
     if not text:
         return []
@@ -755,26 +653,21 @@ def split_user_commands(text: str) -> list[str]:
     parts = [p.strip() for p in raw_parts if p and p.strip()]
     commands: list[str] = []
     last_create_verb: str | None = None
-
     for part in parts:
         lower_part = part.lower()
-
         create_match = re.search(r"\b(созда[ййтеь]*)\b", lower_part)
         if create_match and re.search(r"\bсписок\b", lower_part):
             last_create_verb = create_match.group(1)
             commands.append(part)
             continue
-
         if last_create_verb and re.match(r"^(?:список|лист)\b", lower_part):
             prefix = "создай"
             if last_create_verb:
                 prefix = last_create_verb
             commands.append(f"{prefix} {part}")
             continue
-
         last_create_verb = None
         commands.append(part)
-
     expanded_commands: list[str] = []
     for command in commands:
         create_match = re.search(r"\b(созда[ййтеь]*)\b", command, flags=re.IGNORECASE)
@@ -792,10 +685,7 @@ def split_user_commands(text: str) -> list[str]:
                     expanded_commands.append(f"{prefix} {fragment}".strip())
             continue
         expanded_commands.append(command.strip())
-
     return expanded_commands
-
-
 def parse_multi_list_creation(text: str) -> list[str]:
     if not text:
         return []
@@ -824,8 +714,6 @@ def parse_multi_list_creation(text: str) -> list[str]:
             seen.add(lowered)
             unique.append(item)
     return unique if len(unique) > 1 else []
-
-
 def build_semantic_state(conn, user_id: int, history: list[str] | None = None) -> tuple[dict, dict]:
     lists = get_all_lists(conn, user_id)
     list_tasks: dict[str, list[str]] = {}
@@ -835,12 +723,10 @@ def build_semantic_state(conn, user_id: int, history: list[str] | None = None) -
         except Exception:
             tasks = []
         list_tasks[name] = [title for _, title in tasks[:10]]
-
     last_list = get_ctx(user_id, "last_list")
     last_action = get_ctx(user_id, "last_action")
     pending_delete = get_ctx(user_id, "pending_delete")
     pending_confirmation = get_ctx(user_id, "pending_confirmation")
-
     db_state = {
         "lists": list_tasks,
         "last_list": last_list,
@@ -848,7 +734,6 @@ def build_semantic_state(conn, user_id: int, history: list[str] | None = None) -
         "total_lists": len(lists),
         "total_tasks": sum(len(items) for items in list_tasks.values()),
     }
-
     session_state: dict[str, Any] = {
         "last_action": last_action,
     }
@@ -861,17 +746,13 @@ def build_semantic_state(conn, user_id: int, history: list[str] | None = None) -
             "name": last_list,
             "tasks": list_tasks.get(last_list, []),
         }
-
     recent_tasks = get_all_tasks(conn, user_id)
     if recent_tasks:
         session_state["recent_tasks"] = [
             {"list": list_name, "title": title}
             for list_name, title in recent_tasks[:10]
         ]
-
     return db_state, session_state
-
-
 async def perform_create_list(target: Any, conn, user_id: int, list_name: str, tasks: list[str] | None = None) -> bool:
     try:
         logging.info(f"Creating list: {list_name}")
@@ -895,9 +776,9 @@ async def perform_create_list(target: Any, conn, user_id: int, list_name: str, t
         if message_obj is None:
             message_obj = target
         if details:
-            message = f"{header}  \n{details}\n\n{list_block}"
+            message = f"{header} \n{details}\n\n{list_block}"
         else:
-            message = f"{header}  \n\n{list_block}"
+            message = f"{header} \n\n{list_block}"
         await message_obj.reply_text(message, parse_mode="Markdown")
         set_ctx(user_id, last_action="create_list", last_list=list_name)
         return True
@@ -908,7 +789,6 @@ async def perform_create_list(target: Any, conn, user_id: int, list_name: str, t
             message_obj = target
         await message_obj.reply_text("⚠️ Не удалось создать список. Проверь логи.")
         return False
-
 def map_tasks_to_lists(conn, user_id: int, task_titles: list[str]) -> dict[str, str]:
     mapping: dict[str, str] = {}
     if not task_titles:
@@ -920,7 +800,6 @@ def map_tasks_to_lists(conn, user_id: int, task_titles: list[str]) -> dict[str, 
             if raw_lower in items and original not in mapping:
                 mapping[original] = list_name
     return mapping
-
 async def handle_pending_confirmation(message, context: ContextTypes.DEFAULT_TYPE, conn, user_id: int, pending_confirmation: dict) -> bool:
     if not pending_confirmation:
         return False
@@ -988,17 +867,15 @@ async def handle_pending_confirmation(message, context: ContextTypes.DEFAULT_TYP
         await message.reply_text("⚠️ Не удалось обработать подтверждение. Попробуй сформулировать команду заново.")
         set_ctx(user_id, pending_confirmation=None)
         return False
-
 async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [["Показать списки", "Создать список"], ["Добавить задачу", "Помощь"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, selective=True)
     await update.message.reply_text("Выбери действие или напиши/скажи:", reply_markup=reply_markup)
-
 async def expand_all_lists(update: Update, conn, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     lists = get_all_lists(conn, user_id)
     if not lists:
         await update.message.reply_text(
-            f"{ALL_LISTS_ICON} *Твои списки:*  \n_— пусто —_",
+            f"{ALL_LISTS_ICON} *Твои списки:* \n_— пусто —_",
             parse_mode="Markdown",
         )
         return
@@ -1007,165 +884,14 @@ async def expand_all_lists(update: Update, conn, user_id: int, context: ContextT
         format_list_output(conn, user_id, name, heading_label=f"{SECTION_ICON} *{name}:*")
         for name in lists
     ]
-    message = f"{ALL_LISTS_ICON} *Твои списки:*  \n{overview}\n\n" + "\n\n".join(detailed_blocks)
+    message = f"{ALL_LISTS_ICON} *Твои списки:* \n{overview}\n\n" + "\n\n".join(detailed_blocks)
     await update.message.reply_text(message, parse_mode="Markdown")
     set_ctx(user_id, last_action="show_lists")
-
-
-def merge_add_task_with_clarify(actions: list, user_id: int, original_text: str) -> list:
-    if not actions:
-        return actions
-    add_indices = [idx for idx, obj in enumerate(actions) if obj.get("action") == "add_task"]
-    if len(add_indices) != 1:
-        return actions
-    add_index = add_indices[0]
-    clarifies_after = [idx for idx in range(add_index + 1, len(actions)) if actions[idx].get("action") == "clarify"]
-    if not clarifies_after:
-        return actions
-    if any(actions[idx].get("action") != "clarify" for idx in range(add_index + 1, len(actions))):
-        return actions
-    base_action = dict(actions[add_index])
-    tasks_field = base_action.get("tasks") if isinstance(base_action.get("tasks"), list) else None
-    base_tasks: list[str] = []
-    if tasks_field:
-        base_tasks = [t for t in tasks_field if isinstance(t, str) and t.strip()]
-    title_field = base_action.get("title")
-    if isinstance(title_field, str) and title_field.strip():
-        if not base_tasks:
-            base_tasks = [title_field.strip()]
-        elif title_field.strip().lower() not in {t.lower() for t in base_tasks}:
-            base_tasks.insert(0, title_field.strip())
-    if not base_tasks:
-        return actions
-    list_name = base_action.get("list") or get_ctx(user_id, "last_list")
-    extracted = extract_task_list_from_command(original_text, list_name, base_tasks[0])
-    if not extracted or len(extracted) <= len(base_tasks):
-        return actions
-    combined: list[str] = []
-    seen: set[str] = set()
-    for task in extracted:
-        cleaned = task.strip()
-        if not cleaned:
-            continue
-        key = cleaned.lower()
-        if key not in seen:
-            seen.add(key)
-            combined.append(cleaned)
-    if len(combined) <= len(base_tasks):
-        return actions
-    base_action["list"] = list_name or base_action.get("list")
-    base_action.pop("title", None)
-    base_action["tasks"] = combined
-    new_actions: list = []
-    for idx, obj in enumerate(actions):
-        if idx == add_index:
-            new_actions.append(base_action)
-        elif idx in clarifies_after:
-            continue
-        else:
-            new_actions.append(obj)
-    logging.info(
-        "Merged add_task with clarifications: %s", json.dumps(base_action, ensure_ascii=False)
-    )
-    return new_actions
-
-
-def enrich_add_task_actions(actions: list, user_id: int, original_text: str) -> list:
-    if not actions:
-        return actions
-
-    updated: list[dict] = [dict(obj) if isinstance(obj, dict) else obj for obj in actions]
-    clarifies_to_remove: set[int] = set()
-
-    def collect_base_tasks(obj: dict) -> list[str]:
-        tasks_field = obj.get("tasks") if isinstance(obj.get("tasks"), list) else []
-        candidates: list[str] = []
-        for item in tasks_field:
-            if isinstance(item, str) and item.strip():
-                candidates.append(item.strip())
-        title_field = obj.get("title") or obj.get("task")
-        if isinstance(title_field, str) and title_field.strip():
-            title_clean = title_field.strip()
-            lower_set = {t.lower() for t in candidates}
-            if title_clean.lower() not in lower_set:
-                candidates.append(title_clean)
-        unique: list[str] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            key = candidate.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(candidate)
-        return unique
-
-    for idx, obj in enumerate(updated):
-        if not isinstance(obj, dict) or obj.get("action") != "add_task":
-            continue
-        base_tasks = collect_base_tasks(obj)
-        if not base_tasks:
-            continue
-        list_name = obj.get("list") or get_ctx(user_id, "last_list")
-        extracted = extract_task_list_from_command(original_text, list_name, base_tasks[0])
-        if not extracted:
-            continue
-        combined: list[str] = []
-        seen: set[str] = set()
-        for raw in extracted:
-            cleaned = re.sub(r"\s+", " ", (raw or "").strip())
-            if not cleaned:
-                continue
-            key = cleaned.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            combined.append(cleaned)
-        if len(combined) <= len(base_tasks):
-            continue
-        obj.pop("title", None)
-        obj["tasks"] = combined
-        # Prepare tokens from additional tasks to suppress redundant clarifications.
-        tokens: set[str] = set()
-        for task in combined[1:]:
-            for token in re.findall(r"[\wё]+", task.lower()):
-                if not token:
-                    continue
-                tokens.add(token)
-                tokens.add(token.rstrip("аеёиоуыэюя"))
-        if not tokens:
-            continue
-        for clar_idx in range(idx + 1, len(updated)):
-            clar_obj = updated[clar_idx]
-            if not isinstance(clar_obj, dict) or clar_obj.get("action") != "clarify":
-                continue
-            question = ""
-            meta = clar_obj.get("meta")
-            if isinstance(meta, dict):
-                question = meta.get("question") or ""
-            question_lower = question.lower()
-            if not question_lower:
-                continue
-            if any(token and token in question_lower for token in tokens):
-                clarifies_to_remove.add(clar_idx)
-
-    if not clarifies_to_remove:
-        return updated
-
-    pruned: list[dict] = []
-    for idx, obj in enumerate(updated):
-        if idx in clarifies_to_remove:
-            continue
-        pruned.append(obj)
-    return pruned
-
-
 async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, actions: list, user_id: int, original_text: str) -> list[str]:
     conn = get_conn()
     logging.info(f"Processing actions: {json.dumps(actions)}")
     normalized_actions = normalize_action_payloads(actions)
     normalized_actions = collapse_mark_done_actions(normalized_actions)
-    actions = merge_add_task_with_clarify(normalized_actions, user_id, original_text)
-    actions = enrich_add_task_actions(actions, user_id, original_text)
     executed_actions: list[str] = []
     pending_delete = get_ctx(user_id, "pending_delete")
     if original_text.lower() in ["да", "yes"] and pending_delete:
@@ -1190,7 +916,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
         await update.message.reply_text("Удаление отменено.")
         set_ctx(user_id, pending_delete=None)
         return executed_actions
-    for obj in actions:
+    for obj in normalized_actions:
         action = obj.get("action", "unknown")
         entity_type = obj.get("entity_type", "task")
         list_name = obj.get("list") or get_ctx(user_id, "last_list")
@@ -1238,24 +964,20 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
             try:
                 logging.info(f"Adding tasks to list: {list_name}")
                 action_icon = get_action_icon("add_task")
-                message_parts: list[str] = []
-                if obj.get("tasks"):
-                    added_tasks: list[str] = []
-                    for t in obj["tasks"]:
-                        task_id = add_task(conn, user_id, list_name, t)
-                        if task_id:
-                            added_tasks.append(t)
-                    if added_tasks:
-                        details = "\n".join(f"{action_icon} {task}" for task in added_tasks)
-                        message_parts.append(f"{action_icon} Добавлены задачи в {LIST_ICON} *{list_name}:*  \n{details}")
-                    else:
-                        message_parts.append(f"⚠️ Все указанные задачи уже есть в {LIST_ICON} *{list_name}*.")
-                elif title:
-                    task_id = add_task(conn, user_id, list_name, title)
+                message_parts = []
+                tasks = obj.get("tasks", []) or ([title] if title else [])
+                if not tasks:  # Если OpenAI не дал tasks, парсим из текста
+                    tasks = extract_task_list_from_command(original_text, list_name)
+                added_tasks = []
+                for t in tasks:
+                    task_id = add_task(conn, user_id, list_name, t)
                     if task_id:
-                        message_parts.append(f"{action_icon} Добавлено в {LIST_ICON} *{list_name}:*  \n{action_icon} {title}")
-                    else:
-                        message_parts.append(f"⚠️ Задача *{title}* уже есть в {LIST_ICON} *{list_name}*.")
+                        added_tasks.append(t)
+                if added_tasks:
+                    details = "\n".join(f"{action_icon} {task}" for task in added_tasks)
+                    message_parts.append(f"{action_icon} Добавлены задачи в {LIST_ICON} *{list_name}:* \n{details}")
+                else:
+                    message_parts.append(f"⚠️ Все указанные задачи уже есть в {LIST_ICON} *{list_name}*.")
                 if message_parts:
                     list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *Актуальный список:*")
                     message_parts.append(list_block)
@@ -1306,7 +1028,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 lists = get_all_lists(conn, user_id)
                 if not lists:
                     await update.message.reply_text(
-                        f"{ALL_LISTS_ICON} *Все твои дела:*  \n_— пусто —_",
+                        f"{ALL_LISTS_ICON} *Все твои дела:* \n_— пусто —_",
                         parse_mode="Markdown",
                     )
                     set_ctx(user_id, last_action="show_all_tasks")
@@ -1390,7 +1112,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     header = f"{action_icon} Удалено из {LIST_ICON} *{ln}:*"
                     details = f"{action_icon} {task_name}"
                     list_block = format_list_output(conn, user_id, ln, heading_label=f"{SECTION_ICON} *{ln}:*")
-                    message = f"{header}  \n{details}\n\n{list_block}"
+                    message = f"{header} \n{details}\n\n{list_block}"
                     await update.message.reply_text(message, parse_mode="Markdown")
                 else:
                     await update.message.reply_text("⚠️ Задача не найдена или уже выполнена.")
@@ -1406,7 +1128,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     deleted = delete_list(conn, user_id, list_name)
                     if deleted:
                         remaining = show_all_lists(conn, user_id, heading_label=f"{ALL_LISTS_ICON} *Оставшиеся списки:*")
-                        message = f"{get_action_icon('delete_list')} Список *{list_name}* удалён.  \n\n{remaining}"
+                        message = f"{get_action_icon('delete_list')} Список *{list_name}* удалён. \n\n{remaining}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                         set_ctx(user_id, last_action="delete_list", last_list=None, pending_delete=None)
                         executed_actions.append("delete_list")
@@ -1448,7 +1170,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     details = "\n".join(f"{action_icon} {task}" for task in completed_tasks)
                     header = f"{action_icon} Готово в {LIST_ICON} *{list_name}:*"
                     list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *{list_name}:*")
-                    message = f"{header}  \n{details}\n\n{list_block}"
+                    message = f"{header} \n{details}\n\n{list_block}"
                     await update.message.reply_text(message, parse_mode="Markdown")
                     executed_actions.append("mark_done")
                 elif tasks_to_mark:
@@ -1461,7 +1183,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                         header = f"{action_icon} Готово в {LIST_ICON} *{list_name}:*"
                         details = f"{action_icon} {matched}"
                         list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *{list_name}:*")
-                        message = f"{header}  \n{details}\n\n{list_block}"
+                        message = f"{header} \n{details}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                         executed_actions.append("mark_done")
                     else:
@@ -1512,7 +1234,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                                 obj["to_list"],
                                 heading_label=f"{SECTION_ICON} *{obj['to_list']}:*",
                             )
-                            message = f"{header}  \n\n{list_block}"
+                            message = f"{header} \n\n{list_block}"
                             await update.message.reply_text(message, parse_mode="Markdown")
                             set_ctx(user_id, last_action="move_entity", last_list=obj["to_list"])
                             executed_actions.append("move_entity")
@@ -1531,7 +1253,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                             obj["to_list"],
                             heading_label=f"{SECTION_ICON} *{obj['to_list']}:*",
                         )
-                        message = f"{header}  \n\n{list_block}"
+                        message = f"{header} \n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                         set_ctx(user_id, last_action="move_entity", last_list=obj["to_list"])
                         executed_actions.append("move_entity")
@@ -1551,7 +1273,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                         header = f"{action_icon} Обновлено в {LIST_ICON} *{list_name}:*"
                         details = f"{action_icon} {old_title} → {meta['new_title']}"
                         list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *{list_name}:*")
-                        message = f"{header}  \n{details}\n\n{list_block}"
+                        message = f"{header} \n{details}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                     else:
                         await update.message.reply_text(f"⚠️ Не удалось изменить задачу по индексу {meta['by_index']} в списке *{list_name}*.")
@@ -1563,7 +1285,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                         header = f"{action_icon} Обновлено в {LIST_ICON} *{list_name}:*"
                         details = f"{action_icon} {title} → {meta['new_title']}"
                         list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *{list_name}:*")
-                        message = f"{header}  \n{details}\n\n{list_block}"
+                        message = f"{header} \n{details}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                     else:
                         await update.message.reply_text(f"⚠️ Не удалось изменить задачу *{title}* в списке *{list_name}*.")
@@ -1586,365 +1308,4 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
         elif action == "restore_task" and entity_type == "task" and list_name and title:
             try:
                 logging.info(f"Restoring task: {title} in list: {list_name}")
-                if meta.get("fuzzy"):
-                    restored, matched = restore_task_fuzzy(conn, user_id, list_name, title)
-                else:
-                    restored = restore_task(conn, user_id, list_name, title)
-                    matched = title if restored else None
-                if restored:
-                    action_icon = get_action_icon("restore_task")
-                    task_name = matched or title
-                    header = f"{action_icon} Восстановлено в {LIST_ICON} *{list_name}:*"
-                    details = f"{action_icon} {task_name}"
-                    list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *{list_name}:*")
-                    message = f"{header}  \n{details}\n\n{list_block}"
-                    await update.message.reply_text(message, parse_mode="Markdown")
-                    executed_actions.append("restore_task")
-                else:
-                    await update.message.reply_text(f"⚠️ Не удалось восстановить *{title}*.")
-                set_ctx(user_id, last_action="restore_task", last_list=list_name)
-            except Exception as e:
-                logging.exception(f"Restore task error: {e}")
-                await update.message.reply_text("⚠️ Не удалось восстановить задачу. Проверь логи.")
-        elif action == "say" and obj.get("text"):
-            try:
-                logging.info(f"Say: {obj['text']}")
-                await update.message.reply_text(obj.get("text"))
-            except Exception as e:
-                logging.exception(f"Say error: {e}")
-                await update.message.reply_text("⚠️ Не удалось отправить сообщение. Проверь логи.")
-        elif action == "clarify" and meta.get("question"):
-            try:
-                question_text_raw = meta.get("question") or ""
-                logging.info(f"Clarify: {question_text_raw}")
-                if meta.get("confirmed"):
-                    set_ctx(user_id, pending_confirmation=None)
-                pending = meta.get("pending")
-                if pending:
-                    question_lower = question_text_raw.lower()
-                    if "удал" in question_lower:
-                        keyboard = [[
-                            InlineKeyboardButton("Да", callback_data=f"clarify_yes:{pending}"),
-                            InlineKeyboardButton("Нет", callback_data="clarify_no"),
-                        ]]
-                        reply_markup = InlineKeyboardMarkup(keyboard)
-                        await update.message.reply_text("🤔 " + question_text_raw, parse_mode="Markdown", reply_markup=reply_markup)
-                        set_ctx(user_id, pending_delete=pending, pending_confirmation=None)
-                    elif "созда" in question_lower:
-                        keyboard = [[
-                            InlineKeyboardButton("Да", callback_data=f"create_list_yes:{pending}"),
-                            InlineKeyboardButton("Нет", callback_data="create_list_no"),
-                        ]]
-                        reply_markup = InlineKeyboardMarkup(keyboard)
-                        await update.message.reply_text("🤔 " + question_text_raw, parse_mode="Markdown", reply_markup=reply_markup)
-                        set_ctx(
-                            user_id,
-                            pending_confirmation={
-                                "type": "create_list",
-                                "list": pending,
-                                "question": question_text_raw,
-                            },
-                        )
-                    else:
-                        keyboard = [[
-                            InlineKeyboardButton("Да", callback_data="clarify_generic_yes"),
-                            InlineKeyboardButton("Нет", callback_data="clarify_generic_no"),
-                        ]]
-                        reply_markup = InlineKeyboardMarkup(keyboard)
-                        await update.message.reply_text("🤔 " + question_text_raw, parse_mode="Markdown", reply_markup=reply_markup)
-                        confirmation_payload = {
-                            "question": question_text_raw,
-                            "entity_type": entity_type,
-                            "list": list_name,
-                            "original_text": original_text,
-                            "pending": pending,
-                            "type": "generic",
-                        }
-                        set_ctx(user_id, pending_confirmation=confirmation_payload)
-                else:
-                    keyboard = [[
-                        InlineKeyboardButton("Да", callback_data="clarify_generic_yes"),
-                        InlineKeyboardButton("Нет", callback_data="clarify_generic_no"),
-                    ]]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    await update.message.reply_text("🤔 " + question_text_raw, parse_mode="Markdown", reply_markup=reply_markup)
-                    confirmation_payload = {
-                        "question": question_text_raw,
-                        "entity_type": entity_type,
-                        "list": list_name,
-                        "original_text": original_text,
-                        "type": "generic",
-                    }
-                    question_lower = question_text_raw.lower()
-                    if entity_type == "task" and "удал" in question_lower:
-                        tasks_to_handle = extract_tasks_from_question(question_text_raw)
-                        confirmation_payload.update(
-                            {
-                                "type": "delete_tasks",
-                                "tasks": tasks_to_handle,
-                            }
-                        )
-                    set_ctx(user_id, pending_confirmation=confirmation_payload)
-            except Exception as e:
-                logging.exception(f"Clarify error: {e}")
-                await update.message.reply_text("⚠️ Не удалось уточнить. Проверь логи.")
-        else:
-            name_from_text = text_mentions_list_and_name(original_text)
-            if name_from_text:
-                logging.info(f"Showing tasks for list from text: {name_from_text}")
-                if not find_list(conn, user_id, name_from_text):
-                    question = f"⚠️ Списка *{name_from_text}* нет. Создать?"
-                    keyboard = [[
-                        InlineKeyboardButton("Да", callback_data=f"create_list_yes:{name_from_text}"),
-                        InlineKeyboardButton("Нет", callback_data="create_list_no"),
-                    ]]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    await update.message.reply_text(question, parse_mode="Markdown", reply_markup=reply_markup)
-                    set_ctx(
-                        user_id,
-                        pending_confirmation={
-                            "type": "create_list",
-                            "list": name_from_text,
-                            "question": question,
-                        },
-                    )
-                    continue
-                items = get_list_tasks(conn, user_id, name_from_text)
-                if items:
-                    txt = "\n".join([f"{i}. {t}" for i, t in items])
-                    await update.message.reply_text(f"📋 *{name_from_text}:*\n{txt}", parse_mode="Markdown")
-                else:
-                    await update.message.reply_text(f"📋 *{name_from_text}:*\n— пусто —", parse_mode="Markdown")
-                set_ctx(user_id, last_action="show_tasks", last_list=name_from_text)
-                continue
-            logging.info("Unknown command, no context match")
-            await update.message.reply_text("🤔 Не понял, что нужно сделать.")
-            await send_menu(update, context)
-        logging.info(f"User {user_id}: {original_text} -> Action: {action}")
-    return executed_actions
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_text: str | None = None):
-    user_id = update.effective_user.id
-    text = (input_text or update.message.text or "").strip()
-    logging.info(f"📩 Text from {user_id}: {text}")
-    try:
-        conn = get_conn()
-        commands = split_user_commands(text)
-        if not commands:
-            commands = [text]
-        for part in commands:
-            command_text = part.strip()
-            if not command_text:
-                continue
-            history = get_ctx(user_id, "history", [])
-            lower_command = command_text.lower()
-            pending_delete = get_ctx(user_id, "pending_delete")
-            pending_confirmation = get_ctx(user_id, "pending_confirmation")
-            if lower_command in ["да", "yes", "нет", "no"] and (pending_delete or pending_confirmation):
-                if lower_command in ["да", "yes"]:
-                    if pending_delete:
-                        try:
-                            logging.info(f"Deleting list via pending_delete: {pending_delete}")
-                            deleted = delete_list(conn, user_id, pending_delete)
-                            if deleted:
-                                remaining = show_all_lists(conn, user_id, heading_label=f"{ALL_LISTS_ICON} *Оставшиеся списки:*")
-                                message = f"{get_action_icon('delete_list')} Список *{pending_delete}* удалён.  \n\n{remaining}"
-                                await update.message.reply_text(message, parse_mode="Markdown")
-                                set_ctx(user_id, pending_delete=None, pending_confirmation=None, last_list=None)
-                            else:
-                                await update.message.reply_text(f"⚠️ Список *{pending_delete}* не найден.")
-                                set_ctx(user_id, pending_delete=None)
-                        except Exception as e:
-                            logging.exception(f"Delete list error during confirmation: {e}")
-                            await update.message.reply_text("⚠️ Ошибка удаления.")
-                            set_ctx(user_id, pending_delete=None)
-                    elif pending_confirmation:
-                        await handle_pending_confirmation(update.message, context, conn, user_id, pending_confirmation)
-                else:
-                    if pending_delete:
-                        await update.message.reply_text("❎ Отмена удаления.")
-                        set_ctx(user_id, pending_delete=None)
-                    if pending_confirmation:
-                        await update.message.reply_text("❎ Отмена.")
-                        set_ctx(user_id, pending_confirmation=None)
-                continue
-            multi_lists = parse_multi_list_creation(command_text)
-            if multi_lists:
-                actions = [{"action": "create", "entity_type": "list", "list": name} for name in multi_lists]
-                executed_actions = await route_actions(update, context, actions, user_id, command_text) or []
-                if any(action in SIGNIFICANT_ACTIONS and action not in HISTORY_SKIP_ACTIONS for action in executed_actions):
-                    history = get_ctx(user_id, "history", [])
-                    set_ctx(user_id, history=history + [command_text])
-                continue
-            completed_titles = parse_completed_task_titles(command_text)
-            if completed_titles:
-                payload = {
-                    "actions": [
-                        {"action": "mark_done", "entity_type": "task", "title": title}
-                        for title in completed_titles
-                    ]
-                }
-                summary_text = format_completion_summary(completed_titles)
-                if summary_text:
-                    payload["ui_text"] = summary_text
-                executed_actions = await route_actions(update, context, [payload], user_id, command_text) or []
-                if any(action in SIGNIFICANT_ACTIONS and action not in HISTORY_SKIP_ACTIONS for action in executed_actions):
-                    history = get_ctx(user_id, "history", [])
-                    set_ctx(user_id, history=history + [command_text])
-                continue
-            db_state, session_state = build_semantic_state(conn, user_id, history)
-            user_profile = get_user_profile(conn, user_id)
-            prompt = SEMANTIC_PROMPT.format(history=json.dumps(history, ensure_ascii=False),
-                                           db_state=json.dumps(db_state, ensure_ascii=False),
-                                           session_state=json.dumps(session_state, ensure_ascii=False),
-                                           user_profile=json.dumps(user_profile, ensure_ascii=False),
-                                           lexicon=SEMANTIC_LEXICON_JSON,
-                                           pending_delete=get_ctx(user_id, "pending_delete", ""))
-            logging.info(f"Sending to OpenAI: {command_text}")
-            resp = await asyncio.to_thread(
-                lambda: client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": command_text}
-                    ],
-                )
-            )
-            raw = resp.choices[0].message.content.strip()
-            logging.info(f"🤖 RAW: {raw}")
-            try:
-                with open(RAW_LOG_FILE, "a", encoding="utf-8") as f:
-                    f.write(f"\n=== RAW ({user_id}) ===\n{command_text}\n{raw}\n")
-            except Exception:
-                logging.warning("Failed to write to openai_raw.log")
-            actions = extract_json_blocks(raw)
-            if not actions:
-                if wants_expand(command_text) and get_ctx(user_id, "last_action") == "show_lists":
-                    logging.info("No actions, but expanding lists due to context")
-                    await expand_all_lists(update, conn, user_id, context)
-                    continue
-                logging.warning("No valid JSON actions from OpenAI")
-                await update.message.reply_text("⚠️ Модель ответила не в JSON-формате.")
-                await send_menu(update, context)
-                continue
-            executed_actions = await route_actions(update, context, actions, user_id, command_text) or []
-            if any(action in SIGNIFICANT_ACTIONS and action not in HISTORY_SKIP_ACTIONS for action in executed_actions):
-                history = get_ctx(user_id, "history", [])
-                set_ctx(user_id, history=history + [command_text])
-    except Exception as e:
-        logging.exception(f"❌ handle_text error: {e}")
-        await update.message.reply_text("Произошла ошибка при обработке. Проверь логи.")
-        await send_menu(update, context)
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    logging.info(f"🎙 Voice from {user_id}")
-    try:
-        vf = await update.message.voice.get_file()
-        ogg = os.path.join(TEMP_DIR, f"{user_id}_voice.ogg")
-        wav = os.path.join(TEMP_DIR, f"{user_id}_voice.wav")
-        await vf.download_to_drive(ogg)
-        AudioSegment.from_ogg(ogg).export(wav, format="wav")
-        r = sr.Recognizer()
-        with sr.AudioFile(wav) as src:
-            audio = r.record(src)
-            text = r.recognize_google(audio, language="ru-RU")
-            text = normalize_text(text)
-        logging.info(f"🗣 ASR: {text}")
-        await update.message.reply_text(f"🗣 {text}")
-        await handle_text(update, context, input_text=text)
-        try:
-            os.remove(ogg); os.remove(wav)
-        except Exception:
-            pass
-    except Exception as e:
-        logging.exception(f"❌ voice error: {e}")
-        await update.message.reply_text("⚠️ Не удалось обработать голос. Проверь логи.")
-        await send_menu(update, context)
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-    logging.info(f"Callback from {user_id}: {data}")
-    conn = get_conn()
-    try:
-        if data.startswith("delete_list:"):
-            list_name = data.split(":")[1]
-            deleted = delete_list(conn, user_id, list_name)
-            if deleted:
-                remaining = show_all_lists(conn, user_id, heading_label=f"{ALL_LISTS_ICON} *Оставшиеся списки:*")
-                message = f"{get_action_icon('delete_list')} Список *{list_name}* удалён.  \n\n{remaining}"
-                await query.edit_message_text(message, parse_mode="Markdown")
-                set_ctx(user_id, last_action="delete_list", last_list=None, pending_delete=None)
-            else:
-                await query.edit_message_text(f"⚠️ Список *{list_name}* не найден.")
-                set_ctx(user_id, pending_delete=None)
-        elif data == "cancel_delete":
-            await query.edit_message_text("❎ Отмена удаления.")
-            set_ctx(user_id, pending_delete=None)
-        elif data.startswith("clarify_yes:"):
-            list_name = data.split(":")[1]
-            deleted = delete_list(conn, user_id, list_name)
-            if deleted:
-                remaining = show_all_lists(conn, user_id, heading_label=f"{ALL_LISTS_ICON} *Оставшиеся списки:*")
-                message = f"{get_action_icon('delete_list')} Список *{list_name}* удалён.  \n\n{remaining}"
-                await query.edit_message_text(message, parse_mode="Markdown")
-                set_ctx(user_id, last_action="delete_list", last_list=None, pending_delete=None)
-            else:
-                await query.edit_message_text(f"⚠️ Список *{list_name}* не найден.")
-                set_ctx(user_id, pending_delete=None)
-        elif data == "clarify_no":
-            await query.edit_message_text("❎ Отмена удаления.")
-            set_ctx(user_id, pending_delete=None)
-        elif data == "clarify_generic_yes":
-            pending_conf = get_ctx(user_id, "pending_confirmation")
-            if pending_conf:
-                handled = await handle_pending_confirmation(query.message, context, conn, user_id, pending_conf)
-                set_ctx(user_id, pending_confirmation=None)
-                if handled:
-                    await query.edit_message_text("✅ Подтверждение получено.")
-                else:
-                    await query.edit_message_text("⚠️ Не удалось обработать подтверждение.")
-            else:
-                await query.edit_message_text("⚠️ Нет действий для подтверждения.")
-        elif data == "clarify_generic_no":
-            await query.edit_message_text("Хорошо, отмена.")
-            set_ctx(user_id, pending_confirmation=None)
-        elif data.startswith("create_list_yes:"):
-            list_name = data.split(":", 1)[1]
-            conn = get_conn()
-            existing = find_list(conn, user_id, list_name)
-            if existing:
-                await query.edit_message_text(f"⚠️ Список *{list_name}* уже существует.", parse_mode="Markdown")
-                set_ctx(user_id, pending_confirmation=None, last_list=list_name)
-            else:
-                try:
-                    create_list(conn, user_id, list_name)
-                    await query.edit_message_text(f"🆕 Создан список *{list_name}*", parse_mode="Markdown")
-                    set_ctx(user_id, pending_confirmation=None, last_action="create_list", last_list=list_name)
-                except Exception as e:
-                    logging.exception(f"Create list via callback error: {e}")
-                    await query.edit_message_text("⚠️ Не удалось создать список. Проверь логи.")
-                    set_ctx(user_id, pending_confirmation=None)
-        elif data == "create_list_no":
-            await query.edit_message_text("Хорошо, не создаю.")
-            set_ctx(user_id, pending_confirmation=None)
-        else:
-            await query.edit_message_text("⚠️ Неизвестная команда.")
-    except Exception as e:
-        logging.exception(f"Callback error: {e}")
-        await query.edit_message_text("⚠️ Ошибка обработки. Проверь логи.")
-
-def main():
-    init_db()
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    logging.info("🚀 Aura v5.2 started.")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+                if meta.get
