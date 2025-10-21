@@ -1308,4 +1308,173 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
         elif action == "restore_task" and entity_type == "task" and list_name and title:
             try:
                 logging.info(f"Restoring task: {title} in list: {list_name}")
-                if meta.get
+                if meta.get("fuzzy"):
+                    restored, matched = restore_task_fuzzy(conn, user_id, list_name, title)
+                else:
+                    restored = restore_task(conn, user_id, list_name, title)
+                    matched = title if restored else None
+                if restored:
+                    await update.message.reply_text(f"🔄 Задача *{matched}* восстановлена в списке *{list_name}*.", parse_mode="Markdown")
+                else:
+                    await update.message.reply_text(f"⚠️ Не удалось восстановить *{title}*.")
+                set_ctx(user_id, last_action="restore_task", last_list=list_name)
+            except Exception as e:
+                logging.exception(f"Restore task error: {e}")
+                await update.message.reply_text("⚠️ Не удалось восстановить задачу. Проверь логи.")
+        elif action == "say" and obj.get("text"):
+            try:
+                logging.info(f"Say: {obj['text']}")
+                await update.message.reply_text(obj.get("text"))
+            except Exception as e:
+                logging.exception(f"Say error: {e}")
+                await update.message.reply_text("⚠️ Не удалось отправить сообщение. Проверь логи.")
+        elif action == "clarify" and meta.get("question"):
+            try:
+                logging.info(f"Clarify: {meta['question']}")
+                keyboard = [[InlineKeyboardButton("Да", callback_data=f"clarify_yes:{meta.get('pending')}"), InlineKeyboardButton("Нет", callback_data="clarify_no")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.message.reply_text("🤔 " + meta.get("question"), parse_mode="Markdown", reply_markup=reply_markup)
+                set_ctx(user_id, pending_delete=meta.get("pending"))
+                await send_menu(update, context)
+            except Exception as e:
+                logging.exception(f"Clarify error: {e}")
+                await update.message.reply_text("⚠️ Не удалось уточнить. Проверь логи.")
+        else:
+            name_from_text = text_mentions_list_and_name(original_text)
+            if name_from_text:
+                logging.info(f"Showing tasks for list from text: {name_from_text}")
+                items = get_list_tasks(conn, user_id, name_from_text)
+                if items:
+                    txt = "\n".join([f"{i}. {t}" for i, t in items])
+                    await update.message.reply_text(f"📋 *{name_from_text}:*\n{txt}", parse_mode="Markdown")
+                    set_ctx(user_id, last_action="show_tasks", last_list=name_from_text)
+                    continue
+                await update.message.reply_text(f"Список *{name_from_text}* пуст или не существует.")
+            logging.info("Unknown command, no context match")
+            await update.message.reply_text("🤔 Не понял, что нужно сделать.")
+            await send_menu(update, context)
+        logging.info(f"User {user_id}: {original_text} -> Action: {action}")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_text: str | None = None):
+    user_id = update.effective_user.id
+    text = (input_text or update.message.text or "").strip()
+    logging.info(f"📩 Text from {user_id}: {text}")
+    try:
+        conn = get_conn()
+        db_state = {
+            "lists": {n: [t for _, t in get_list_tasks(conn, user_id, n)] for n in get_all_lists(conn, user_id)},
+            "last_list": get_ctx(user_id, "last_list"),
+            "pending_delete": get_ctx(user_id, "pending_delete")
+        }
+        history = get_ctx(user_id, "history", [])
+        user_profile = get_user_profile(conn, user_id)
+        prompt = SEMANTIC_PROMPT.format(history=json.dumps(history, ensure_ascii=False), 
+                                       db_state=json.dumps(db_state, ensure_ascii=False),
+                                       user_profile=json.dumps(user_profile, ensure_ascii=False),
+                                       pending_delete=get_ctx(user_id, "pending_delete", ""))
+        logging.info(f"Sending to OpenAI: {text}")
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text}
+            ],
+        )
+        raw = resp.choices[0].message.content.strip()
+        logging.info(f"🤖 RAW: {raw}")
+        try:
+            with open("/opt/aura-assistant/openai_raw.log", "a", encoding="utf-8") as f:
+                f.write(f"\n=== RAW ({user_id}) ===\n{text}\n{raw}\n")
+        except Exception:
+            logging.warning("Failed to write to openai_raw.log")
+        actions = extract_json_blocks(raw)
+        if not actions:
+            if wants_expand(text) and get_ctx(user_id, "last_action") == "show_lists":
+                logging.info("No actions, but expanding lists due to context")
+                await expand_all_lists(update, conn, user_id, context)
+                return
+            logging.warning("No valid JSON actions from OpenAI")
+            await update.message.reply_text("⚠️ Модель ответила не в JSON-формате.")
+            await send_menu(update, context)
+            return
+        await route_actions(update, context, actions, user_id, text)
+        set_ctx(user_id, history=history + [text])
+    except Exception as e:
+        logging.exception(f"❌ handle_text error: {e}")
+        await update.message.reply_text("Произошла ошибка при обработке. Проверь логи.")
+        await send_menu(update, context)
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    logging.info(f"🎙 Voice from {user_id}")
+    try:
+        vf = await update.message.voice.get_file()
+        ogg = os.path.join(TEMP_DIR, f"{user_id}_voice.ogg")
+        wav = os.path.join(TEMP_DIR, f"{user_id}_voice.wav")
+        await vf.download_to_drive(ogg)
+        AudioSegment.from_ogg(ogg).export(wav, format="wav")
+        r = sr.Recognizer()
+        with sr.AudioFile(wav) as src:
+            audio = r.record(src)
+            text = r.recognize_google(audio, language="ru-RU")
+            text = normalize_text(text)
+        logging.info(f"🗣 ASR: {text}")
+        await update.message.reply_text(f"🗣 {text}")
+        await handle_text(update, context, input_text=text)
+        try:
+            os.remove(ogg); os.remove(wav)
+        except Exception:
+            pass
+    except Exception as e:
+        logging.exception(f"❌ voice error: {e}")
+        await update.message.reply_text("⚠️ Не удалось обработать голос. Проверь логи.")
+        await send_menu(update, context)
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+    logging.info(f"Callback from {user_id}: {data}")
+    try:
+        if data.startswith("delete_list:"):
+            list_name = data.split(":")[1]
+            deleted = delete_list(get_conn(), user_id, list_name)
+            if deleted:
+                await query.edit_message_text(f"🗑 Список *{list_name}* удалён.", parse_mode="Markdown")
+                set_ctx(user_id, last_action="delete_list", last_list=None, pending_delete=None)
+            else:
+                await query.edit_message_text(f"⚠️ Список *{list_name}* не найден.")
+                set_ctx(user_id, pending_delete=None)
+        elif data == "cancel_delete":
+            await query.edit_message_text("Хорошо, отмена удаления.")
+            set_ctx(user_id, pending_delete=None)
+        elif data.startswith("clarify_yes:"):
+            list_name = data.split(":")[1]
+            deleted = delete_list(get_conn(), user_id, list_name)
+            if deleted:
+                await query.edit_message_text(f"🗑 Список *{list_name}* удалён.", parse_mode="Markdown")
+                set_ctx(user_id, last_action="delete_list", last_list=None, pending_delete=None)
+            else:
+                await query.edit_message_text(f"⚠️ Список *{list_name}* не найден.")
+                set_ctx(user_id, pending_delete=None)
+        elif data == "clarify_no":
+            await query.edit_message_text("Хорошо, отмена удаления.")
+            set_ctx(user_id, pending_delete=None)
+        else:
+            await query.edit_message_text("⚠️ Неизвестная команда.")
+    except Exception as e:
+        logging.exception(f"Callback error: {e}")
+        await query.edit_message_text("⚠️ Ошибка обработки. Проверь логи.")
+
+def main():
+    init_db()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    logging.info("🚀 Aura v5.2 started.")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
