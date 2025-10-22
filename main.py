@@ -1133,7 +1133,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 if tasks:
                     lines = []
                     for list_title, task_title in tasks:
-                        list_display = list_title or "Без списка"
+                        list_display = list_title or "Архив"
                         lines.append(f"✅ *{list_display}*: {task_title}")
                     header = "✅ Выполненные задачи (последние 15):\n"
                     await update.message.reply_text(header + "\n".join(lines), parse_mode="Markdown")
@@ -1392,12 +1392,17 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
             try:
                 logger.info(f"Restoring task: {title} in list: {list_name}")
                 if meta.get("fuzzy"):
-                    restored, matched = restore_task_fuzzy(conn, user_id, list_name, title)
+                    restored, matched, suggestion = restore_task_fuzzy(conn, user_id, list_name, title)
                 else:
-                    restored = restore_task(conn, user_id, list_name, title)
-                    matched = title if restored else None
+                    restored, matched, suggestion = restore_task(conn, user_id, list_name, title)
                 if restored:
-                    await update.message.reply_text(f"🔄 Задача *{matched}* восстановлена в списке *{list_name}*.", parse_mode="Markdown")
+                    resolved_title = matched or title
+                    await update.message.reply_text(
+                        f"🔄 Задача *{resolved_title}* восстановлена в списке *{list_name}*.",
+                        parse_mode="Markdown",
+                    )
+                elif suggestion:
+                    await update.message.reply_text(suggestion)
                 else:
                     await update.message.reply_text(f"⚠️ Не удалось восстановить *{title}*.")
                 set_ctx(user_id, last_action="restore_task", last_list=list_name)

@@ -129,6 +129,7 @@ def _get_list_id(conn: sqlite3.Connection, user_id: int, list_name: str) -> int 
         """
         SELECT id FROM entities
         WHERE user_id = ? AND type = 'list' AND LOWER(title) = LOWER(?)
+          AND (json_extract(meta, '$.deleted') IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE)
         LIMIT 1
         """,
         (user_id, list_name),
@@ -192,6 +193,7 @@ def _list_restorable_tasks(
           AND (
                 json_extract(meta, '$.deleted') = true
              OR json_extract(meta, '$.status') = 'done'
+             OR json_extract(meta, '$.archived') = true
           )
         """,
         (user_id, list_id),
@@ -536,7 +538,10 @@ def delete_list(conn: sqlite3.Connection, user_id: int, list_name: str) -> int:
         ).fetchall()
         for task_row in task_rows:
             task_meta = _load_meta(task_row["meta"])
-            task_meta["deleted"] = True
+            task_meta.pop("deleted", None)
+            task_meta["archived"] = True
+            if list_name:
+                task_meta["archived_from"] = list_name
             conn.execute(
                 "UPDATE entities SET meta = ? WHERE id = ?",
                 (_dump_meta(task_meta), task_row["id"]),
@@ -571,16 +576,56 @@ def delete_task(conn: sqlite3.Connection, user_id: int, list_name: str, task_tit
         logging.error("SQLite error in delete_task: %s", exc)
         return 0
 
-def restore_task(conn, user_id, list_name, task_title):
+def _suggest_new_list_for_restore(
+    conn: sqlite3.Connection, user_id: int, list_name: str, task_title: str
+) -> str | None:
+    try:
+        cur = conn.execute(
+            """
+            SELECT 1
+            FROM entities
+            WHERE user_id = ? AND type = 'task'
+              AND LOWER(title) = LOWER(?)
+              AND json_extract(meta, '$.archived') = true
+              AND (
+                    json_extract(meta, '$.archived_from') IS NULL
+                 OR LOWER(json_extract(meta, '$.archived_from')) = LOWER(?)
+              )
+            LIMIT 1
+            """,
+            (user_id, task_title, list_name),
+        )
+        if cur.fetchone():
+            return (
+                f"Список «{list_name}» удалён. Создай новый список и скажи, куда вернуть задачу «{task_title}»."
+            )
+        return None
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in _suggest_new_list_for_restore: %s", exc)
+        return None
+
+
+def restore_task(
+    conn: sqlite3.Connection, user_id: int, list_name: str, task_title: str
+) -> tuple[int, str | None, str | None]:
     try:
         list_id = _get_list_id(conn, user_id, list_name)
         if list_id is None:
-            return 0
+            suggestion = _suggest_new_list_for_restore(conn, user_id, list_name, task_title)
+            if suggestion:
+                logging.info(
+                    "List '%s' missing for restore_task; suggesting new list for user %s",
+                    list_name,
+                    user_id,
+                )
+            else:
+                logging.info("No list '%s' found for user %s", list_name, user_id)
+            return 0, None, suggestion
         candidate_rows = list(_list_restorable_tasks(conn, user_id, list_id))
         candidates = [(row["id"], row["title"], row["meta"]) for row in candidate_rows]
         if not candidates:
             logging.info("No restorable tasks in list '%s' for user %s", list_name, user_id)
-            return 0
+            return 0, None, None
         chosen = _select_candidate(task_title, candidates)
         if not chosen:
             logging.info(
@@ -589,11 +634,15 @@ def restore_task(conn, user_id, list_name, task_title):
                 list_name,
                 user_id,
             )
-            return 0
+            return 0, None, None
         chosen_id, chosen_title, meta_text = chosen
         meta = _load_meta(meta_text)
         changed = False
         if meta.pop("deleted", None):
+            changed = True
+        if meta.pop("archived", None):
+            changed = True
+        if meta.pop("archived_from", None) is not None:
             changed = True
         if meta.get("status") == "done":
             meta.pop("status", None)
@@ -605,37 +654,48 @@ def restore_task(conn, user_id, list_name, task_title):
                 list_name,
                 user_id,
             )
-            return 0
+            return 0, None, None
         conn.execute(
             "UPDATE entities SET meta = ? WHERE id = ?",
             (_dump_meta(meta), chosen_id),
         )
         logging.info("Restored task '%s' in list '%s' for user %s", chosen_title, list_name, user_id)
-        return 1
+        return 1, chosen_title, None
     except sqlite3.Error as exc:
         logging.error("SQLite error in restore_task: %s", exc)
-        return 0
+        return 0, None, None
 
 
-def restore_task_fuzzy(conn, user_id, list_name, pattern):
+def restore_task_fuzzy(
+    conn: sqlite3.Connection, user_id: int, list_name: str, pattern: str
+) -> tuple[int, str | None, str | None]:
     try:
         if not pattern:
             logging.info("No pattern provided for fuzzy restore in list '%s' for user %s", list_name, user_id)
-            return 0, None
+            return 0, None, None
         cleaned = re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ ]+", " ", pattern).strip()
         if not cleaned:
             logging.info("Invalid pattern after cleaning for fuzzy restore in list '%s' for user %s", list_name, user_id)
-            return 0, None
+            return 0, None, None
         list_id = _get_list_id(conn, user_id, list_name)
         if list_id is None:
-            return 0, None
+            suggestion = _suggest_new_list_for_restore(conn, user_id, list_name, pattern)
+            if suggestion:
+                logging.info(
+                    "List '%s' missing for fuzzy restore; suggesting new list for user %s",
+                    list_name,
+                    user_id,
+                )
+            else:
+                logging.info("No list '%s' found for fuzzy restore for user %s", list_name, user_id)
+            return 0, None, suggestion
         candidates = [
             (row["id"], row["title"], row["meta"])
             for row in _list_restorable_tasks(conn, user_id, list_id)
         ]
         if not candidates:
             logging.info("No deleted tasks found in list '%s' for user %s", list_name, user_id)
-            return 0, None
+            return 0, None, None
         logging.info(
             "Restore search candidates: %s",
             [title for _, title, _ in candidates],
@@ -643,7 +703,7 @@ def restore_task_fuzzy(conn, user_id, list_name, pattern):
         chosen = _score_candidates(_tokenize(pattern), cleaned, candidates)
         if not chosen:
             logging.info("No close match for pattern '%s' in list '%s' for user %s", cleaned, list_name, user_id)
-            return 0, None
+            return 0, None, None
         chosen_id, chosen_title, meta_text = chosen
         meta = _load_meta(meta_text)
         changed = False
@@ -652,6 +712,10 @@ def restore_task_fuzzy(conn, user_id, list_name, pattern):
         if meta.get("status") == "done":
             meta.pop("status", None)
             changed = True
+        if meta.pop("archived", None):
+            changed = True
+        if meta.pop("archived_from", None) is not None:
+            changed = True
         if not changed:
             logging.info(
                 "Task '%s' already active in list '%s' for user %s",
@@ -659,34 +723,65 @@ def restore_task_fuzzy(conn, user_id, list_name, pattern):
                 list_name,
                 user_id,
             )
-            return 0, None
+            return 0, None, None
         conn.execute(
             "UPDATE entities SET meta = ? WHERE id = ?",
             (_dump_meta(meta), chosen_id),
         )
         logging.info("Fuzzy restored task '%s' in list '%s' for user %s", chosen_title, list_name, user_id)
-        return 1, chosen_title
+        return 1, chosen_title, None
     except sqlite3.Error as exc:
         logging.error("SQLite error in restore_task_fuzzy: %s", exc)
-        return 0, None
+        return 0, None, None
 
 def get_completed_tasks(conn: sqlite3.Connection, user_id: int, limit: int = 15) -> list[tuple[str, str]]:
     try:
-        cur = conn.execute(
-            """
-            SELECT l.title AS list_title, e.title AS task_title
+        query = """
+            SELECT
+                e.title AS task_title,
+                CASE
+                    WHEN json_extract(e.meta, '$.archived') = true
+                         OR l.id IS NULL
+                         OR json_extract(l.meta, '$.deleted') = true
+                    THEN 1
+                    ELSE 0
+                END AS archived_flag,
+                CASE
+                    WHEN json_extract(e.meta, '$.archived') = true
+                         OR l.id IS NULL
+                         OR json_extract(l.meta, '$.deleted') = true
+                    THEN COALESCE(json_extract(e.meta, '$.archived_from'), l.title)
+                    ELSE l.title
+                END AS source_title
             FROM entities e
-            LEFT JOIN entities l ON l.id = e.parent_id
+            LEFT JOIN entities l ON l.id = e.parent_id AND l.type = 'list'
             WHERE e.user_id = ?
               AND e.type = 'task'
-              AND json_extract(e.meta, '$.status') = 'done'
+              AND (
+                    json_extract(e.meta, '$.status') = 'done'
+                 OR json_extract(e.meta, '$.done') = true
+                )
               AND (json_extract(e.meta, '$.deleted') IS NULL OR json_extract(e.meta, '$.deleted') IS NOT TRUE)
-            ORDER BY e.created_at DESC
+            ORDER BY COALESCE(json_extract(e.meta, '$.completed_at'), e.created_at) DESC
             LIMIT ?
-            """,
-            (user_id, limit),
+        """
+        _trace_sql(
+            "get_completed_tasks query | params=%s | %s"
+            % (str((user_id, limit)), " ".join(line.strip() for line in query.strip().splitlines()))
         )
-        tasks = [(row["list_title"], row["task_title"]) for row in cur.fetchall()]
+        cur = conn.execute(query, (user_id, limit))
+        tasks: list[tuple[str, str]] = []
+        for row in cur.fetchall():
+            archived_flag = row["archived_flag"] if isinstance(row, sqlite3.Row) else row[1]
+            source_title = row["source_title"] if isinstance(row, sqlite3.Row) else row[2]
+            task_title = row["task_title"] if isinstance(row, sqlite3.Row) else row[0]
+            if archived_flag:
+                display_title = "Архив"
+                if source_title:
+                    display_title = f"{display_title} • {source_title}"
+            else:
+                display_title = source_title or "Архив"
+            tasks.append((display_title, task_title))
         logging.info("Retrieved %s completed tasks for user %s", len(tasks), user_id)
         return tasks
     except sqlite3.Error as exc:
