@@ -1,9 +1,16 @@
-import sqlite3, json, os, re
-from Levenshtein import distance
-import logging
-from typing import Iterable, List, Tuple
+from __future__ import annotations
 
-DB_PATH = "/opt/aura-assistant/db.sqlite3"
+import json
+import logging
+import os
+import re
+import sqlite3
+from collections.abc import Iterable, Sequence
+from typing import Any
+
+from Levenshtein import distance
+
+DB_PATH = os.getenv("DB_PATH", "/opt/aura-assistant/db.sqlite3")
 
 _TOKEN_STOPWORDS = {
     "и",
@@ -23,9 +30,7 @@ _TOKEN_STOPWORDS = {
     "сделаны",
     "сделан",
 }
-
-
-def _tokenize(text: str) -> List[str]:
+def _tokenize(text: str) -> list[str]:
     parts = re.split(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", (text or "").lower())
     return [p for p in parts if p and p not in _TOKEN_STOPWORDS]
 
@@ -33,11 +38,11 @@ def _tokenize(text: str) -> List[str]:
 def _score_candidates(
     pattern_tokens: Iterable[str],
     cleaned_pattern: str,
-    candidates: Iterable[Tuple[int, str, str]],
-) -> Tuple[int, str, str] | None:
+    candidates: Iterable[tuple[int, str, str]],
+) -> tuple[int, str, str] | None:
     pt_set = set(pattern_tokens)
     cleaned_lower = cleaned_pattern.lower()
-    scored: list[tuple[int, int, int, Tuple[int, str, str]]] = []
+    scored: list[tuple[int, int, int, tuple[int, str, str]]] = []
     for candidate in candidates:
         cand_id, cand_title, cand_meta = candidate
         title_lower = cand_title.lower()
@@ -69,6 +74,95 @@ def _score_candidates(
     best = scored[0][3]
     return best
 
+
+def _load_meta(meta_text: str | None) -> dict[str, Any]:
+    if not meta_text:
+        return {}
+    try:
+        return json.loads(meta_text)
+    except json.JSONDecodeError:
+        logging.warning("Failed to decode meta payload: %s", meta_text)
+        return {}
+
+
+def _dump_meta(meta: dict[str, Any] | None) -> str | None:
+    if not meta:
+        return None
+    return json.dumps(meta, ensure_ascii=False)
+
+
+def _get_list_id(conn: sqlite3.Connection, user_id: int, list_name: str) -> int | None:
+    cur = conn.execute(
+        """
+        SELECT id FROM entities
+        WHERE user_id = ? AND type = 'list' AND title = ?
+        LIMIT 1
+        """,
+        (user_id, list_name),
+    )
+    row = cur.fetchone()
+    if not row:
+        logging.info("No list '%s' found for user %s", list_name, user_id)
+        return None
+    return row["id"] if isinstance(row, sqlite3.Row) else row[0]
+
+
+def _get_task_row(
+    conn: sqlite3.Connection,
+    user_id: int,
+    list_id: int,
+    title: str,
+) -> sqlite3.Row | None:
+    cur = conn.execute(
+        """
+        SELECT id, title, meta
+        FROM entities
+        WHERE user_id = ? AND type = 'task' AND parent_id = ? AND title = ?
+        LIMIT 1
+        """,
+        (user_id, list_id, title),
+    )
+    return cur.fetchone()
+
+
+def _list_active_tasks(
+    conn: sqlite3.Connection,
+    user_id: int,
+    list_id: int,
+) -> Sequence[sqlite3.Row]:
+    cur = conn.execute(
+        """
+        SELECT id, title, meta
+        FROM entities
+        WHERE user_id = ? AND type = 'task' AND parent_id = ?
+          AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE)
+          AND json_extract(meta, '$.status') != 'done'
+        ORDER BY created_at ASC
+        """,
+        (user_id, list_id),
+    )
+    return cur.fetchall()
+
+
+def _list_restorable_tasks(
+    conn: sqlite3.Connection,
+    user_id: int,
+    list_id: int,
+) -> Sequence[sqlite3.Row]:
+    cur = conn.execute(
+        """
+        SELECT id, title, meta
+        FROM entities
+        WHERE user_id = ? AND type = 'task' AND parent_id = ?
+          AND (
+                json_extract(meta, '$.deleted') = true
+             OR json_extract(meta, '$.status') = 'done'
+          )
+        """,
+        (user_id, list_id),
+    )
+    return cur.fetchall()
+
 ENTITIES_DDL = """
 CREATE TABLE IF NOT EXISTS entities (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,399 +177,424 @@ CREATE TABLE IF NOT EXISTS entities (
 );
 """
 
-def get_conn():
+def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.isolation_level = None
     return conn
 
-def init_db():
+def init_db() -> None:
     conn = get_conn()
     with conn:
         conn.execute(ENTITIES_DDL)
     conn.close()
 
-def _get_or_create_list(conn, user_id, list_name):
+def _get_or_create_list(conn: sqlite3.Connection, user_id: int, list_name: str) -> int | None:
+    existing_id = _get_list_id(conn, user_id, list_name)
+    if existing_id is not None:
+        logging.info("List '%s' already exists for user %s, ID: %s", list_name, user_id, existing_id)
+        return existing_id
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
-        row = cur.fetchone()
-        if row:
-            logging.info(f"List '{list_name}' already exists for user {user_id}, ID: {row[0]}")
-            return row[0]
-        cur.execute("""INSERT INTO entities (user_id, type, title) VALUES (?, 'list', ?)""", (user_id, list_name))
+        cur = conn.execute(
+            """
+            INSERT INTO entities (user_id, type, title)
+            VALUES (?, 'list', ?)
+            """,
+            (user_id, list_name),
+        )
         list_id = cur.lastrowid
-        logging.info(f"Created list '{list_name}' for user {user_id}, ID: {list_id}")
+        logging.info("Created list '%s' for user %s, ID: %s", list_name, user_id, list_id)
         return list_id
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in _get_or_create_list: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in _get_or_create_list: %s", exc)
         raise
 
-def create_list(conn, user_id, list_name):
+
+def create_list(conn: sqlite3.Connection, user_id: int, list_name: str) -> int | None:
     return _get_or_create_list(conn, user_id, list_name)
 
-def rename_list(conn, user_id, old_name, new_name):
+def rename_list(conn: sqlite3.Connection, user_id: int, old_name: str, new_name: str) -> int:
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, old_name))
-        row = cur.fetchone()
-        if not row:
-            logging.info(f"No list '{old_name}' found for user {user_id}")
+        list_id = _get_list_id(conn, user_id, old_name)
+        if list_id is None:
             return 0
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, new_name))
-        if cur.fetchone():
-            logging.info(f"List '{new_name}' already exists for user {user_id}")
+        if _get_list_id(conn, user_id, new_name) is not None:
+            logging.info("List '%s' already exists for user %s", new_name, user_id)
             return 0
-        cur.execute("""UPDATE entities SET title=? WHERE id=?""", (new_name, row["id"]))
-        logging.info(f"Renamed list '{old_name}' to '{new_name}' for user {user_id}")
+        conn.execute(
+            "UPDATE entities SET title = ? WHERE id = ?",
+            (new_name, list_id),
+        )
+        logging.info("Renamed list '%s' to '%s' for user %s", old_name, new_name, user_id)
         return 1
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in rename_list: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in rename_list: %s", exc)
         return 0
 
-def find_list(conn, user_id, list_name):
+
+def find_list(conn: sqlite3.Connection, user_id: int, list_name: str) -> sqlite3.Row | None:
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id, title FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
+        cur = conn.execute(
+            """
+            SELECT id, title
+            FROM entities
+            WHERE user_id = ? AND type = 'list' AND title = ?
+            LIMIT 1
+            """,
+            (user_id, list_name),
+        )
         return cur.fetchone()
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in find_list: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in find_list: %s", exc)
         return None
 
-def get_all_lists(conn, user_id):
+
+def get_all_lists(conn: sqlite3.Connection, user_id: int) -> list[str]:
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT title FROM entities WHERE user_id=? AND type='list' AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE) ORDER BY title ASC""", (user_id,))
+        cur = conn.execute(
+            """
+            SELECT title
+            FROM entities
+            WHERE user_id = ? AND type = 'list'
+              AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE)
+            ORDER BY title ASC
+            """,
+            (user_id,),
+        )
         return [row["title"] for row in cur.fetchall()]
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in get_all_lists: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in get_all_lists: %s", exc)
         return []
 
-def add_task(conn, user_id, list_name, title):
-    cur = conn.cursor()
-    # Check if list exists
-    cur.execute("SELECT id FROM entities WHERE user_id = ? AND type = 'list' AND title = ?", (user_id, list_name))
-    list_id = cur.fetchone()
-    if not list_id:
-        logging.info(f"No list '{list_name}' found for user {user_id}")
+def add_task(conn: sqlite3.Connection, user_id: int, list_name: str, title: str) -> int | None:
+    list_id = _get_list_id(conn, user_id, list_name)
+    if list_id is None:
         return None
-    list_id = list_id[0]
-    # Check if task already exists
-    cur.execute("""
-        SELECT id, meta FROM entities 
-        WHERE user_id = ? AND type = 'task' AND title = ? AND parent_id = ?
-    """, (user_id, title, list_id))
-    existing_task = cur.fetchone()
+    existing_task = _get_task_row(conn, user_id, list_id, title)
     if existing_task:
-        meta = json.loads(existing_task['meta']) if existing_task['meta'] else {}
-        logging.info(f"Found existing task '{title}' in list '{list_name}' for user {user_id} with meta: {meta}")
-        if meta.get('status') == 'done':
-            cur.execute("""
-                UPDATE entities 
-                SET meta = NULL 
-                WHERE id = ?
-            """, (existing_task['id'],))
-            conn.commit()
-            logging.info(f"Restored task '{title}' in list '{list_name}' for user {user_id}")
-            return existing_task['id']
-        else:
-            logging.info(f"Task '{title}' already exists and is not done in list '{list_name}' for user {user_id}")
-            return None
-    # Insert new task
+        meta = _load_meta(existing_task["meta"])
+        logging.info(
+            "Found existing task '%s' in list '%s' for user %s with meta: %s",
+            title,
+            list_name,
+            user_id,
+            meta,
+        )
+        if meta.get("status") == "done":
+            conn.execute(
+                "UPDATE entities SET meta = NULL WHERE id = ?",
+                (existing_task["id"],),
+            )
+            logging.info("Restored task '%s' in list '%s' for user %s", title, list_name, user_id)
+            return existing_task["id"]
+        logging.info(
+            "Task '%s' already exists and is not done in list '%s' for user %s",
+            title,
+            list_name,
+            user_id,
+        )
+        return None
     try:
-        cur.execute("INSERT INTO entities (user_id, type, title, parent_id) VALUES (?, ?, ?, ?)", 
-                    (user_id, 'task', title, list_id))
+        cur = conn.execute(
+            "INSERT INTO entities (user_id, type, title, parent_id) VALUES (?, 'task', ?, ?)",
+            (user_id, title, list_id),
+        )
         task_id = cur.lastrowid
-        conn.commit()
-        logging.info(f"Added new task '{title}' to list '{list_name}' for user {user_id}")
+        logging.info("Added new task '%s' to list '%s' for user %s", title, list_name, user_id)
         return task_id
-    except sqlite3.IntegrityError as e:
-        logging.error(f"IntegrityError: Failed to add task '{title}' to list '{list_name}' for user {user_id}: {e}")
+    except sqlite3.IntegrityError as exc:
+        logging.error(
+            "IntegrityError: Failed to add task '%s' to list '%s' for user %s: %s",
+            title,
+            list_name,
+            user_id,
+            exc,
+        )
         return None
 
-def update_task(conn, user_id, list_name, old_title, new_title):
+def update_task(conn: sqlite3.Connection, user_id: int, list_name: str, old_title: str, new_title: str) -> int:
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
-        row = cur.fetchone()
-        if not row:
-            logging.info(f"No list '{list_name}' found for user {user_id}")
+        list_id = _get_list_id(conn, user_id, list_name)
+        if list_id is None:
             return 0
-        list_id = row["id"]
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND title=? LIMIT 1""", (user_id, list_id, old_title))
-        task = cur.fetchone()
-        if not task:
-            logging.info(f"No task '{old_title}' found in list '{list_name}' for user {user_id}")
+        task_row = _get_task_row(conn, user_id, list_id, old_title)
+        if not task_row:
+            logging.info("No task '%s' found in list '%s' for user %s", old_title, list_name, user_id)
             return 0
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND title=? LIMIT 1""", (user_id, list_id, new_title))
-        if cur.fetchone():
-            logging.info(f"Task '{new_title}' already exists in list '{list_name}' for user {user_id}")
+        if _get_task_row(conn, user_id, list_id, new_title):
+            logging.info("Task '%s' already exists in list '%s' for user %s", new_title, list_name, user_id)
             return 0
-        cur.execute("""UPDATE entities SET title=? WHERE id=?""", (new_title, task["id"]))
-        logging.info(f"Updated task '{old_title}' to '{new_title}' in list '{list_name}' for user {user_id}")
+        conn.execute("UPDATE entities SET title = ? WHERE id = ?", (new_title, task_row["id"]))
+        logging.info(
+            "Updated task '%s' to '%s' in list '%s' for user %s",
+            old_title,
+            new_title,
+            list_name,
+            user_id,
+        )
         return 1
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in update_task: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in update_task: %s", exc)
         return 0
 
-def update_task_by_index(conn, user_id, list_name, index, new_title):
+
+def update_task_by_index(
+    conn: sqlite3.Connection,
+    user_id: int,
+    list_name: str,
+    index: int,
+    new_title: str,
+) -> tuple[int, str | None]:
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
-        row = cur.fetchone()
-        if not row:
-            logging.info(f"No list '{list_name}' found for user {user_id}")
+        list_id = _get_list_id(conn, user_id, list_name)
+        if list_id is None:
             return 0, None
-        list_id = row["id"]
-        cur.execute("""SELECT id, title FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE AND json_extract(meta, '$.status') != 'done') ORDER BY created_at ASC""", 
-                    (user_id, list_id))
-        tasks = cur.fetchall()
+        tasks = _list_active_tasks(conn, user_id, list_id)
         if not tasks or index < 1 or index > len(tasks):
-            logging.info(f"Invalid index {index} for list '{list_name}' for user {user_id}")
+            logging.info("Invalid index %s for list '%s' for user %s", index, list_name, user_id)
             return 0, None
         chosen = tasks[index - 1]
         task_id, old_title = chosen["id"], chosen["title"]
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND title=? LIMIT 1""", (user_id, list_id, new_title))
-        if cur.fetchone():
-            logging.info(f"Task '{new_title}' already exists in list '{list_name}' for user {user_id}")
+        if _get_task_row(conn, user_id, list_id, new_title):
+            logging.info("Task '%s' already exists in list '%s' for user %s", new_title, list_name, user_id)
             return 0, None
-        cur.execute("""UPDATE entities SET title=? WHERE id=?""", (new_title, task_id))
-        logging.info(f"Updated task '{old_title}' to '{new_title}' by index {index} in list '{list_name}' for user {user_id}")
+        conn.execute("UPDATE entities SET title = ? WHERE id = ?", (new_title, task_id))
+        logging.info(
+            "Updated task '%s' to '%s' by index %s in list '%s' for user %s",
+            old_title,
+            new_title,
+            index,
+            list_name,
+            user_id,
+        )
         return 1, old_title
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in update_task_by_index: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in update_task_by_index: %s", exc)
         return 0, None
 
-def get_list_tasks(conn, user_id, list_name):
+def get_list_tasks(conn: sqlite3.Connection, user_id: int, list_name: str) -> list[tuple[int, str]]:
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
-        row = cur.fetchone()
-        if not row:
-            logging.info(f"No list '{list_name}' found for user {user_id}")
+        list_id = _get_list_id(conn, user_id, list_name)
+        if list_id is None:
             return []
-        list_id = row["id"]
-        cur.execute("""SELECT title FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE AND json_extract(meta, '$.status') != 'done') ORDER BY created_at ASC""", 
-                    (user_id, list_id))
-        tasks = [(i+1, r["title"]) for i, r in enumerate(cur.fetchall())]
-        logging.info(f"Retrieved {len(tasks)} tasks for list '{list_name}' for user {user_id}")
-        return tasks
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in get_list_tasks: {e}")
+        tasks = _list_active_tasks(conn, user_id, list_id)
+        results = [(idx + 1, row["title"]) for idx, row in enumerate(tasks)]
+        logging.info("Retrieved %s tasks for list '%s' for user %s", len(results), list_name, user_id)
+        return results
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in get_list_tasks: %s", exc)
         return []
 
-def mark_task_done(conn, user_id, list_name, task_title):
+def mark_task_done(conn: sqlite3.Connection, user_id: int, list_name: str, task_title: str) -> int:
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
-        row = cur.fetchone()
-        if not row:
-            logging.info(f"No list '{list_name}' found for user {user_id}")
+        list_id = _get_list_id(conn, user_id, list_name)
+        if list_id is None:
             return 0
-        list_id = row["id"]
-        cur.execute("""SELECT id, meta FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND title=? LIMIT 1""", (user_id, list_id, task_title))
-        task = cur.fetchone()
-        if not task:
-            logging.info(f"No task '{task_title}' found in list '{list_name}' for user {user_id}")
+        task_row = _get_task_row(conn, user_id, list_id, task_title)
+        if not task_row:
+            logging.info("No task '%s' found in list '%s' for user %s", task_title, list_name, user_id)
             return 0
-        meta = {}
-        if task["meta"]:
-            try: meta = json.loads(task["meta"])
-            except: meta = {}
+        meta = _load_meta(task_row["meta"])
         meta["status"] = "done"
-        cur.execute("""UPDATE entities SET meta=? WHERE id=?""", (json.dumps(meta, ensure_ascii=False), task["id"]))
-        logging.info(f"Marked task '{task_title}' as done in list '{list_name}' for user {user_id}")
-        return cur.rowcount
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in mark_task_done: {e}")
+        conn.execute(
+            "UPDATE entities SET meta = ? WHERE id = ?",
+            (_dump_meta(meta), task_row["id"]),
+        )
+        logging.info("Marked task '%s' as done in list '%s' for user %s", task_title, list_name, user_id)
+        return 1
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in mark_task_done: %s", exc)
         return 0
 
-def mark_task_done_fuzzy(conn, user_id, list_name, pattern):
+
+def mark_task_done_fuzzy(
+    conn: sqlite3.Connection,
+    user_id: int,
+    list_name: str,
+    pattern: str,
+) -> tuple[int, str | None]:
     try:
         if not pattern:
-            logging.info(f"No pattern provided for fuzzy mark done in list '{list_name}' for user {user_id}")
+            logging.info("No pattern provided for fuzzy mark done in list '%s' for user %s", list_name, user_id)
             return 0, None
-        q = re.sub(r'[^0-9a-zA-Zа-яА-ЯёЁ ]+', ' ', pattern).strip()
-        if not q:
-            logging.info(f"Invalid pattern after cleaning for fuzzy mark done in list '{list_name}' for user {user_id}")
+        cleaned = re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ ]+", " ", pattern).strip()
+        if not cleaned:
+            logging.info("Invalid pattern after cleaning for fuzzy mark done in list '%s' for user %s", list_name, user_id)
             return 0, None
-        pattern_tokens = _tokenize(pattern)
-        cur = conn.cursor()
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
-        row = cur.fetchone()
-        if not row:
-            logging.info(f"No list '{list_name}' found for user {user_id}")
+        list_id = _get_list_id(conn, user_id, list_name)
+        if list_id is None:
             return 0, None
-        list_id = row["id"]
-        cur.execute("""SELECT id, title, meta FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE AND json_extract(meta, '$.status') != 'done')""",
-                    (user_id, list_id))
-        candidates = [(r["id"], r["title"], r["meta"]) for r in cur.fetchall()]
+        candidates = [
+            (row["id"], row["title"], row["meta"])
+            for row in _list_active_tasks(conn, user_id, list_id)
+        ]
         if not candidates:
-            logging.info(f"No tasks found in list '{list_name}' for user {user_id}")
+            logging.info("No tasks found in list '%s' for user %s", list_name, user_id)
             return 0, None
-        chosen = _score_candidates(pattern_tokens, q, candidates)
+        chosen = _score_candidates(_tokenize(pattern), cleaned, candidates)
         if not chosen:
-            logging.info(f"No close match for pattern '{q}' in list '{list_name}' for user {user_id}")
+            logging.info("No close match for pattern '%s' in list '%s' for user %s", cleaned, list_name, user_id)
             return 0, None
-        chosen_id, chosen_title, meta = chosen
-        try:
-            meta = json.loads(meta) if meta else {}
-        except:
-            meta = {}
+        chosen_id, chosen_title, meta_text = chosen
+        meta = _load_meta(meta_text)
         meta["status"] = "done"
-        cur.execute("UPDATE entities SET meta=? WHERE id=?", (json.dumps(meta, ensure_ascii=False), chosen_id))
-        logging.info(f"Fuzzy marked task '{chosen_title}' as done in list '{list_name}' for user {user_id}")
+        conn.execute(
+            "UPDATE entities SET meta = ? WHERE id = ?",
+            (_dump_meta(meta), chosen_id),
+        )
+        logging.info("Fuzzy marked task '%s' as done in list '%s' for user %s", chosen_title, list_name, user_id)
         return 1, chosen_title
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in mark_task_done_fuzzy: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in mark_task_done_fuzzy: %s", exc)
         return 0, None
 
-def delete_list(conn, user_id, list_name):
+def delete_list(conn: sqlite3.Connection, user_id: int, list_name: str) -> int:
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id, meta FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
+        cur = conn.execute(
+            """
+            SELECT id, meta FROM entities
+            WHERE user_id = ? AND type = 'list' AND title = ?
+            LIMIT 1
+            """,
+            (user_id, list_name),
+        )
         row = cur.fetchone()
         if not row:
-            logging.info(f"No list '{list_name}' found for user {user_id}")
-            return 0
-        list_id, meta = row["id"], row["meta"]
-        try: meta = json.loads(meta) if meta else {}
-        except: meta = {}
-        meta["deleted"] = True
-        cur.execute("UPDATE entities SET meta=? WHERE id=?", (json.dumps(meta, ensure_ascii=False), list_id))
-        cur.execute("""SELECT id, meta FROM entities WHERE user_id=? AND type='task' AND parent_id=?""", (user_id, list_id))
-        for r in cur.fetchall():
-            m = {}
-            try: m = json.loads(r["meta"]) if r["meta"] else {}
-            except: m = {}
-            m["deleted"] = True
-            cur.execute("UPDATE entities SET meta=? WHERE id=?", (json.dumps(m, ensure_ascii=False), r["id"]))
-        logging.info(f"Deleted list '{list_name}' for user {user_id}")
-        return 1
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in delete_list: {e}")
-        return 0
-
-def delete_task(conn, user_id, list_name, task_title):
-    try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
-        row = cur.fetchone()
-        if not row:
-            logging.info(f"No list '{list_name}' found for user {user_id}")
+            logging.info("No list '%s' found for user %s", list_name, user_id)
             return 0
         list_id = row["id"]
-        cur.execute("""SELECT id, meta FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND title=? LIMIT 1""", (user_id, list_id, task_title))
-        t = cur.fetchone()
-        if not t:
-            logging.info(f"No task '{task_title}' found in list '{list_name}' for user {user_id}")
+        list_meta = _load_meta(row["meta"])
+        list_meta["deleted"] = True
+        conn.execute(
+            "UPDATE entities SET meta = ? WHERE id = ?",
+            (_dump_meta(list_meta), list_id),
+        )
+        task_rows = conn.execute(
+            """
+            SELECT id, meta
+            FROM entities
+            WHERE user_id = ? AND type = 'task' AND parent_id = ?
+            """,
+            (user_id, list_id),
+        ).fetchall()
+        for task_row in task_rows:
+            task_meta = _load_meta(task_row["meta"])
+            task_meta["deleted"] = True
+            conn.execute(
+                "UPDATE entities SET meta = ? WHERE id = ?",
+                (_dump_meta(task_meta), task_row["id"]),
+            )
+        logging.info("Deleted list '%s' for user %s", list_name, user_id)
+        return 1
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in delete_list: %s", exc)
+        return 0
+
+def delete_task(conn: sqlite3.Connection, user_id: int, list_name: str, task_title: str) -> int:
+    try:
+        list_id = _get_list_id(conn, user_id, list_name)
+        if list_id is None:
             return 0
-        meta = json.loads(t["meta"]) if t["meta"] else {}
+        task_row = _get_task_row(conn, user_id, list_id, task_title)
+        if not task_row:
+            logging.info("No task '%s' found in list '%s' for user %s", task_title, list_name, user_id)
+            return 0
+        meta = _load_meta(task_row["meta"])
         if meta.get("status") == "done":
-            logging.info(f"Task '{task_title}' is already done in list '{list_name}' for user {user_id}")
+            logging.info("Task '%s' is already done in list '%s' for user %s", task_title, list_name, user_id)
             return 0
         meta["deleted"] = True
-        cur.execute("UPDATE entities SET meta=? WHERE id=?", (json.dumps(meta, ensure_ascii=False), t["id"]))
-        logging.info(f"Deleted task '{task_title}' from list '{list_name}' for user {user_id}")
+        conn.execute(
+            "UPDATE entities SET meta = ? WHERE id = ?",
+            (_dump_meta(meta), task_row["id"]),
+        )
+        logging.info("Deleted task '%s' from list '%s' for user %s", task_title, list_name, user_id)
         return 1
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in delete_task: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in delete_task: %s", exc)
         return 0
 
 def restore_task(conn, user_id, list_name, task_title):
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
-        row = cur.fetchone()
-        if not row:
-            logging.info(f"No list '{list_name}' found for user {user_id}")
+        list_id = _get_list_id(conn, user_id, list_name)
+        if list_id is None:
             return 0
-        list_id = row["id"]
-        cur.execute("""SELECT id, meta FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND title=? LIMIT 1""", (user_id, list_id, task_title))
-        t = cur.fetchone()
-        if not t:
-            logging.info(f"No task '{task_title}' found in list '{list_name}' for user {user_id}', fallback to fuzzy")
-            restored, matched = restore_task_fuzzy(conn, user_id, list_name, task_title)
+        task_row = _get_task_row(conn, user_id, list_id, task_title)
+        if not task_row:
+            logging.info(
+                "No task '%s' found in list '%s' for user %s, falling back to fuzzy",
+                task_title,
+                list_name,
+                user_id,
+            )
+            restored, _ = restore_task_fuzzy(conn, user_id, list_name, task_title)
             return 1 if restored else 0
-        meta = json.loads(t["meta"]) if t["meta"] else {}
+        meta = _load_meta(task_row["meta"])
         meta["deleted"] = False
         if "status" in meta:
             meta["status"] = "open"
-        cur.execute("UPDATE entities SET meta=? WHERE id=?", (json.dumps(meta, ensure_ascii=False), t["id"]))
-        logging.info(f"Restored task '{task_title}' in list '{list_name}' for user {user_id}")
+        conn.execute(
+            "UPDATE entities SET meta = ? WHERE id = ?",
+            (_dump_meta(meta), task_row["id"]),
+        )
+        logging.info("Restored task '%s' in list '%s' for user %s", task_title, list_name, user_id)
         return 1
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in restore_task: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in restore_task: %s", exc)
         return 0
+
 
 def restore_task_fuzzy(conn, user_id, list_name, pattern):
     try:
         if not pattern:
-            logging.info(f"No pattern provided for fuzzy restore in list '{list_name}' for user {user_id}")
+            logging.info("No pattern provided for fuzzy restore in list '%s' for user %s", list_name, user_id)
             return 0, None
-        q = re.sub(r'[^0-9a-zA-Zа-яА-ЯёЁ ]+', ' ', pattern).strip()
-        if not q:
-            logging.info(f"Invalid pattern after cleaning for fuzzy restore in list '{list_name}' for user {user_id}")
+        cleaned = re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ ]+", " ", pattern).strip()
+        if not cleaned:
+            logging.info("Invalid pattern after cleaning for fuzzy restore in list '%s' for user %s", list_name, user_id)
             return 0, None
-        pattern_tokens = _tokenize(pattern)
-        cur = conn.cursor()
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
-        row = cur.fetchone()
-        if not row:
-            logging.info(f"No list '{list_name}' found for user {user_id}")
+        list_id = _get_list_id(conn, user_id, list_name)
+        if list_id is None:
             return 0, None
-        list_id = row["id"]
-        cur.execute(
-            """
-            SELECT id, title, meta
-            FROM entities
-            WHERE user_id=?
-              AND type='task'
-              AND parent_id=?
-              AND (
-                    json_extract(meta, '$.deleted') = true
-                 OR json_extract(meta, '$.status') = 'done'
-              )
-            """,
-            (user_id, list_id),
-        )
-        candidates = [(r["id"], r["title"], r["meta"]) for r in cur.fetchall()]
+        candidates = [
+            (row["id"], row["title"], row["meta"])
+            for row in _list_restorable_tasks(conn, user_id, list_id)
+        ]
         if not candidates:
-            logging.info(f"No deleted tasks found in list '{list_name}' for user {user_id}")
+            logging.info("No deleted tasks found in list '%s' for user %s", list_name, user_id)
             return 0, None
         logging.info(
             "Restore search candidates: %s",
             [title for _, title, _ in candidates],
         )
-        chosen = _score_candidates(pattern_tokens, q, candidates)
+        chosen = _score_candidates(_tokenize(pattern), cleaned, candidates)
         if not chosen:
-            logging.info(f"No close match for pattern '{q}' in list '{list_name}' for user {user_id}")
+            logging.info("No close match for pattern '%s' in list '%s' for user %s", cleaned, list_name, user_id)
             return 0, None
-        chosen_id, chosen_title, meta = chosen
-        try:
-            meta = json.loads(meta) if meta else {}
-        except:
-            meta = {}
+        chosen_id, chosen_title, meta_text = chosen
+        meta = _load_meta(meta_text)
         meta["deleted"] = False
         if "status" in meta:
             meta["status"] = "open"
-        cur.execute("UPDATE entities SET meta=? WHERE id=?", (json.dumps(meta, ensure_ascii=False), chosen_id))
-        logging.info(f"Fuzzy restored task '{chosen_title}' in list '{list_name}' for user {user_id}")
+        conn.execute(
+            "UPDATE entities SET meta = ? WHERE id = ?",
+            (_dump_meta(meta), chosen_id),
+        )
+        logging.info("Fuzzy restored task '%s' in list '%s' for user %s", chosen_title, list_name, user_id)
         return 1, chosen_title
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in restore_task_fuzzy: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in restore_task_fuzzy: %s", exc)
         return 0, None
 
-def get_completed_tasks(conn, user_id, limit: int = 15):
+def get_completed_tasks(conn: sqlite3.Connection, user_id: int, limit: int = 15) -> list[tuple[str, str]]:
     try:
-        cur = conn.cursor()
-        cur.execute(
+        cur = conn.execute(
             """
             SELECT l.title AS list_title, e.title AS task_title
             FROM entities e
             LEFT JOIN entities l ON l.id = e.parent_id
-            WHERE e.user_id=?
-              AND e.type='task'
+            WHERE e.user_id = ?
+              AND e.type = 'task'
               AND json_extract(e.meta, '$.status') = 'done'
               AND (json_extract(e.meta, '$.deleted') IS NULL OR json_extract(e.meta, '$.deleted') IS NOT TRUE)
             ORDER BY e.created_at DESC
@@ -484,23 +603,22 @@ def get_completed_tasks(conn, user_id, limit: int = 15):
             (user_id, limit),
         )
         tasks = [(row["list_title"], row["task_title"]) for row in cur.fetchall()]
-        logging.info(f"Retrieved {len(tasks)} completed tasks for user {user_id}")
+        logging.info("Retrieved %s completed tasks for user %s", len(tasks), user_id)
         return tasks
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in get_completed_tasks: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in get_completed_tasks: %s", exc)
         return []
 
 
-def get_deleted_tasks(conn, user_id, limit: int = 15):
+def get_deleted_tasks(conn: sqlite3.Connection, user_id: int, limit: int = 15) -> list[tuple[str, str]]:
     try:
-        cur = conn.cursor()
-        cur.execute(
+        cur = conn.execute(
             """
             SELECT l.title AS list_title, e.title AS task_title
             FROM entities e
             LEFT JOIN entities l ON l.id = e.parent_id
-            WHERE e.user_id=?
-              AND e.type='task'
+            WHERE e.user_id = ?
+              AND e.type = 'task'
               AND json_extract(e.meta, '$.deleted') = true
             ORDER BY e.created_at DESC
             LIMIT ?
@@ -508,185 +626,242 @@ def get_deleted_tasks(conn, user_id, limit: int = 15):
             (user_id, limit),
         )
         tasks = [(row["list_title"], row["task_title"]) for row in cur.fetchall()]
-        logging.info(f"Retrieved {len(tasks)} deleted tasks for user {user_id}")
+        logging.info("Retrieved %s deleted tasks for user %s", len(tasks), user_id)
         return tasks
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in get_deleted_tasks: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in get_deleted_tasks: %s", exc)
         return []
 
-def search_tasks(conn, user_id, pattern):
+def search_tasks(conn: sqlite3.Connection, user_id: int, pattern: str) -> list[tuple[str, str]]:
     try:
-        q = re.sub(r'[^0-9a-zA-Zа-яА-ЯёЁ ]+', ' ', pattern).strip()
-        if not q:
-            logging.info(f"Invalid pattern for search tasks for user {user_id}")
+        cleaned = re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ ]+", " ", pattern).strip()
+        if not cleaned:
+            logging.info("Invalid pattern for search tasks for user %s", user_id)
             return []
-        cur = conn.cursor()
-        cur.execute("""SELECT l.title AS list_title, e.title AS task_title
-                       FROM entities e
-                       JOIN entities l ON l.id = e.parent_id
-                       WHERE e.user_id=? AND e.type='task' AND LOWER(e.title) LIKE LOWER(?) AND (e.meta IS NULL OR json_extract(e.meta, '$.deleted') IS NOT TRUE AND json_extract(e.meta, '$.status') != 'done')
-                       ORDER BY e.created_at ASC""", (user_id, f"%{q}%"))
+        cur = conn.execute(
+            """
+            SELECT l.title AS list_title, e.title AS task_title
+            FROM entities e
+            JOIN entities l ON l.id = e.parent_id
+            WHERE e.user_id = ? AND e.type = 'task'
+              AND LOWER(e.title) LIKE LOWER(?)
+              AND (e.meta IS NULL OR json_extract(e.meta, '$.deleted') IS NOT TRUE)
+              AND json_extract(e.meta, '$.status') != 'done'
+            ORDER BY e.created_at ASC
+            """,
+            (user_id, f"%{cleaned}%"),
+        )
         tasks = [(row["list_title"], row["task_title"]) for row in cur.fetchall()]
-        logging.info(f"Found {len(tasks)} tasks matching '{q}' for user {user_id}: {tasks}")
+        logging.info(
+            "Found %s tasks matching '%s' for user %s: %s",
+            len(tasks),
+            cleaned,
+            user_id,
+            tasks,
+        )
         return tasks
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in search_tasks: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in search_tasks: %s", exc)
         return []
 
-def fetch_task(conn, user_id, list_name, task_title):
+def fetch_task(conn: sqlite3.Connection, user_id: int, list_name: str, task_title: str):
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT e.id, e.title, e.meta FROM entities e
-                       JOIN entities l ON l.id = e.parent_id
-                       WHERE e.user_id=? AND e.type='task' AND l.type='list' AND l.title=? AND e.title=?
-                       LIMIT 1""", (user_id, list_name, task_title))
+        cur = conn.execute(
+            """
+            SELECT e.id, e.title, e.meta
+            FROM entities e
+            JOIN entities l ON l.id = e.parent_id
+            WHERE e.user_id = ? AND e.type = 'task' AND l.type = 'list'
+              AND l.title = ? AND e.title = ?
+            LIMIT 1
+            """,
+            (user_id, list_name, task_title),
+        )
         task = cur.fetchone()
-        logging.info(f"Fetched task '{task_title}' from list '{list_name}' for user {user_id}: {'Found' if task else 'Not found'}")
+        logging.info(
+            "Fetched task '%s' from list '%s' for user %s: %s",
+            task_title,
+            list_name,
+            user_id,
+            "Found" if task else "Not found",
+        )
         return task
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in fetch_task: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in fetch_task: %s", exc)
         return None
 
-def fetch_list_by_task(conn, user_id, task_title):
+
+def fetch_list_by_task(conn: sqlite3.Connection, user_id: int, task_title: str):
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT l.title AS list_title, e.title AS task_title
-                       FROM entities e
-                       JOIN entities l ON l.id = e.parent_id
-                       WHERE e.user_id=? AND e.type='task' AND e.title=?
-                       LIMIT 1""", (user_id, task_title))
+        cur = conn.execute(
+            """
+            SELECT l.title AS list_title, e.title AS task_title
+            FROM entities e
+            JOIN entities l ON l.id = e.parent_id
+            WHERE e.user_id = ? AND e.type = 'task' AND e.title = ?
+            LIMIT 1
+            """,
+            (user_id, task_title),
+        )
         result = cur.fetchone()
-        logging.info(f"Fetched list by task '{task_title}' for user {user_id}: {'Found' if result else 'Not found'}")
+        logging.info(
+            "Fetched list by task '%s' for user %s: %s",
+            task_title,
+            user_id,
+            "Found" if result else "Not found",
+        )
         return result
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in fetch_list_by_task: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in fetch_list_by_task: %s", exc)
         return None
 
-def move_entity(conn, user_id, entity_type, title, from_list, to_list):
+
+def move_entity(
+    conn: sqlite3.Connection,
+    user_id: int,
+    entity_type: str,
+    title: str,
+    from_list: str,
+    to_list: str,
+) -> int:
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1", (user_id, from_list))
-        from_row = cur.fetchone()
-        if not from_row:
-            logging.info(f"No list '{from_list}' found for user {user_id}")
+        from_list_id = _get_list_id(conn, user_id, from_list)
+        if from_list_id is None:
             return 0
-        from_list_id = from_row["id"]
         to_list_id = _get_or_create_list(conn, user_id, to_list)
-        cur.execute("SELECT id FROM entities WHERE user_id=? AND type=? AND title=? AND parent_id=? LIMIT 1", 
-                    (user_id, entity_type, title, from_list_id))
+        if to_list_id is None:
+            return 0
+        cur = conn.execute(
+            "SELECT id FROM entities WHERE user_id = ? AND type = ? AND title = ? AND parent_id = ? LIMIT 1",
+            (user_id, entity_type, title, from_list_id),
+        )
         entity = cur.fetchone()
         if not entity:
-            logging.info(f"No {entity_type} '{title}' found in list '{from_list}' for user {user_id}")
+            logging.info("No %s '%s' found in list '%s' for user %s", entity_type, title, from_list, user_id)
             return 0
-        cur.execute("UPDATE entities SET parent_id=? WHERE id=?", (to_list_id, entity["id"]))
-        logging.info(f"Moved {entity_type} '{title}' from '{from_list}' to '{to_list}' for user {user_id}")
+        conn.execute("UPDATE entities SET parent_id = ? WHERE id = ?", (to_list_id, entity["id"]))
+        logging.info("Moved %s '%s' from '%s' to '%s' for user %s", entity_type, title, from_list, to_list, user_id)
         return 1
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in move_entity: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in move_entity: %s", exc)
         return 0
 
-def get_all_tasks(conn, user_id):
+def get_all_tasks(conn: sqlite3.Connection, user_id: int) -> list[tuple[str, str]]:
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT l.title AS list_title, e.title AS task_title FROM entities e JOIN entities l ON l.id = e.parent_id WHERE e.user_id=? AND e.type='task' AND (e.meta IS NULL OR json_extract(e.meta, '$.deleted') IS NOT TRUE AND json_extract(e.meta, '$.status') != 'done') ORDER BY l.title, e.created_at", (user_id,))
+        cur = conn.execute(
+            """
+            SELECT l.title AS list_title, e.title AS task_title
+            FROM entities e
+            JOIN entities l ON l.id = e.parent_id
+            WHERE e.user_id = ?
+              AND e.type = 'task'
+              AND (e.meta IS NULL OR json_extract(e.meta, '$.deleted') IS NOT TRUE)
+              AND json_extract(e.meta, '$.status') != 'done'
+            ORDER BY l.title, e.created_at
+            """,
+            (user_id,),
+        )
         tasks = [(row["list_title"], row["task_title"]) for row in cur.fetchall()]
-        logging.info(f"Retrieved {len(tasks)} tasks for user {user_id}")
+        logging.info("Retrieved %s tasks for user %s", len(tasks), user_id)
         return tasks
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in get_all_tasks: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in get_all_tasks: %s", exc)
         return []
 
-def update_user_profile(conn, user_id, city=None, profession=None):
+def update_user_profile(
+    conn: sqlite3.Connection,
+    user_id: int,
+    city: str | None = None,
+    profession: str | None = None,
+) -> int:
     try:
         meta = {"city": city, "profession": profession}
-        cur = conn.cursor()
-        cur.execute("INSERT OR REPLACE INTO entities (user_id, type, title, meta) VALUES (?, 'user_profile', ?, ?)", 
-                    (user_id, f"user_{user_id}", json.dumps(meta, ensure_ascii=False)))
-        logging.info(f"Updated user profile for user {user_id}: {meta}")
+        conn.execute(
+            "INSERT OR REPLACE INTO entities (user_id, type, title, meta) VALUES (?, 'user_profile', ?, ?)",
+            (user_id, f"user_{user_id}", json.dumps(meta, ensure_ascii=False)),
+        )
+        logging.info("Updated user profile for user %s: %s", user_id, meta)
         return 1
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in update_user_profile: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in update_user_profile: %s", exc)
         return 0
 
-def get_user_profile(conn, user_id):
+
+def get_user_profile(conn: sqlite3.Connection, user_id: int) -> dict[str, Any]:
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT meta FROM entities WHERE user_id=? AND type='user_profile' AND title=? LIMIT 1", 
-                    (user_id, f"user_{user_id}"))
+        cur = conn.execute(
+            "SELECT meta FROM entities WHERE user_id = ? AND type = 'user_profile' AND title = ? LIMIT 1",
+            (user_id, f"user_{user_id}"),
+        )
         row = cur.fetchone()
         if row and row["meta"]:
             return json.loads(row["meta"])
         return {}
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in get_user_profile: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in get_user_profile: %s", exc)
         return {}
 
 def delete_task_fuzzy(conn, user_id, list_name, pattern: str):
     try:
         if not pattern:
-            logging.info(f"No pattern provided for fuzzy delete in list '{list_name}' for user {user_id}")
+            logging.info("No pattern provided for fuzzy delete in list '%s' for user %s", list_name, user_id)
             return 0, None
-        q = re.sub(r'[^0-9a-zA-Zа-яА-ЯёЁ ]+', ' ', pattern).strip()
-        if not q:
-            logging.info(f"Invalid pattern after cleaning for fuzzy delete in list '{list_name}' for user {user_id}")
+        cleaned = re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ ]+", " ", pattern).strip()
+        if not cleaned:
+            logging.info("Invalid pattern after cleaning for fuzzy delete in list '%s' for user %s", list_name, user_id)
             return 0, None
-        cur = conn.cursor()
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
-        row = cur.fetchone()
-        if not row:
-            logging.info(f"No list '{list_name}' found for user {user_id}")
+        list_id = _get_list_id(conn, user_id, list_name)
+        if list_id is None:
             return 0, None
-        list_id = row["id"]
-        cur.execute("""SELECT id, title, meta FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE AND json_extract(meta, '$.status') != 'done')""", 
-                    (user_id, list_id))
-        candidates = [(r["id"], r["title"], r["meta"]) for r in cur.fetchall()]
+        candidates = [
+            (row["id"], row["title"], row["meta"])
+            for row in _list_active_tasks(conn, user_id, list_id)
+        ]
         if not candidates:
-            logging.info(f"No tasks found in list '{list_name}' for user {user_id}")
+            logging.info("No tasks found in list '%s' for user %s", list_name, user_id)
             return 0, None
-        candidates.sort(key=lambda x: distance(x[1].lower(), q.lower()))
-        if distance(candidates[0][1].lower(), q.lower()) > len(q) // 2:
-            logging.info(f"No close match for pattern '{q}' in list '{list_name}' for user {user_id}")
+        target = min(
+            candidates,
+            key=lambda item: distance(item[1].lower(), cleaned.lower()),
+        )
+        if distance(target[1].lower(), cleaned.lower()) > len(cleaned) // 2:
+            logging.info("No close match for pattern '%s' in list '%s' for user %s", cleaned, list_name, user_id)
             return 0, None
-        chosen_id, chosen_title, meta = candidates[0]
-        try:
-            m = json.loads(meta) if meta else {}
-        except:
-            m = {}
-        m["deleted"] = True
-        cur.execute("UPDATE entities SET meta=? WHERE id=?", (json.dumps(m, ensure_ascii=False), chosen_id))
-        logging.info(f"Fuzzy deleted task '{chosen_title}' from list '{list_name}' for user {user_id}")
+        chosen_id, chosen_title, meta_text = target
+        meta = _load_meta(meta_text)
+        meta["deleted"] = True
+        conn.execute(
+            "UPDATE entities SET meta = ? WHERE id = ?",
+            (_dump_meta(meta), chosen_id),
+        )
+        logging.info("Fuzzy deleted task '%s' from list '%s' for user %s", chosen_title, list_name, user_id)
         return 1, chosen_title
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in delete_task_fuzzy: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in delete_task_fuzzy: %s", exc)
         return 0, None
+
 
 def delete_task_by_index(conn, user_id, list_name: str, index: int):
     try:
-        cur = conn.cursor()
-        cur.execute("""SELECT id FROM entities WHERE user_id=? AND type='list' AND title=? LIMIT 1""", (user_id, list_name))
-        row = cur.fetchone()
-        if not row:
-            logging.info(f"No list '{list_name}' found for user {user_id}")
+        list_id = _get_list_id(conn, user_id, list_name)
+        if list_id is None:
             return 0, None
-        list_id = row["id"]
-        cur.execute("""SELECT id, title, meta FROM entities WHERE user_id=? AND type='task' AND parent_id=? AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE AND json_extract(meta, '$.status') != 'done') ORDER BY created_at ASC""", 
-                    (user_id, list_id))
-        tasks = cur.fetchall()
+        tasks = _list_active_tasks(conn, user_id, list_id)
         if not tasks or index < 1 or index > len(tasks):
-            logging.info(f"Invalid index {index} for list '{list_name}' for user {user_id}")
+            logging.info("Invalid index %s for list '%s' for user %s", index, list_name, user_id)
             return 0, None
         chosen = tasks[index - 1]
-        task_id, task_title, meta = chosen["id"], chosen["title"], chosen["meta"]
-        try:
-            m = json.loads(meta) if meta else {}
-        except:
-            m = {}
-        m["deleted"] = True
-        cur.execute("UPDATE entities SET meta=? WHERE id=?", (json.dumps(m, ensure_ascii=False), task_id))
-        logging.info(f"Deleted task '{task_title}' by index {index} from list '{list_name}' for user {user_id}")
+        task_id, task_title = chosen["id"], chosen["title"]
+        meta = _load_meta(chosen["meta"])
+        meta["deleted"] = True
+        conn.execute(
+            "UPDATE entities SET meta = ? WHERE id = ?",
+            (_dump_meta(meta), task_id),
+        )
+        logging.info("Deleted task '%s' by index %s from list '%s' for user %s", task_title, index, list_name, user_id)
         return 1, task_title
-    except sqlite3.Error as e:
-        logging.error(f"SQLite error in delete_task_by_index: {e}")
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in delete_task_by_index: %s", exc)
         return 0, None
 
 def normalize_text(value: str) -> str:
@@ -698,39 +873,3 @@ def normalize_text(value: str) -> str:
     value = re.sub(r'\bsp[oO]2\b', 'SPO2', value, flags=re.IGNORECASE)
     return value
 
-def update_entity(conn, user_id: int, entity_type: str, title: str, new_title: str = None, new_content: str = None, meta_update: dict = None):
-    cur = conn.cursor()
-    updates = []
-    params = []
-    if new_title:
-        updates.append("title = ?")
-        params.append(new_title)
-    if new_content:
-        updates.append("content = ?")
-        params.append(new_content)
-    if meta_update:
-        cur.execute("SELECT meta FROM entities WHERE user_id=? AND type=? AND title=?", (user_id, entity_type, title))
-        row = cur.fetchone()
-        if row:
-            meta = json.loads(row[0] or "{}")
-            meta.update(meta_update)
-            updates.append("meta = ?")
-            params.append(json.dumps(meta))
-    if not updates:
-        return None
-    sql = "UPDATE entities SET " + ", ".join(updates) + " WHERE user_id=? AND type=? AND title=?"
-    params.extend([user_id, entity_type, title])
-    cur.execute(sql, params)
-    conn.commit()
-    return cur.rowcount > 0
-
-def move_entity(conn, user_id: int, entity_type: str, title: str, new_parent_title: str):
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM entities WHERE user_id=? AND type='list' AND title=?", (user_id, new_parent_title))
-    new_parent = cur.fetchone()
-    if not new_parent:
-        return None
-    new_parent_id = new_parent[0]
-    cur.execute("UPDATE entities SET parent_id=? WHERE user_id=? AND type=? AND title=?", (new_parent_id, user_id, entity_type, title))
-    conn.commit()
-    return cur.rowcount > 0

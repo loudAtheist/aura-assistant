@@ -1,19 +1,65 @@
-import os, json, re, logging, asyncio
+import json
+import logging
+import os
+import re
 from pathlib import Path
-from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-import speech_recognition as sr
-from pydub import AudioSegment
-from openai import OpenAI
-from openai import AuthenticationError
-from datetime import datetime, timedelta
 from typing import Any
+
+from dotenv import load_dotenv
+from openai import (
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    AuthenticationError,
+    OpenAI,
+    OpenAIError,
+    RateLimitError,
+)
+from pydub import AudioSegment
+import speech_recognition as sr
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
 from db import (
-    rename_list, normalize_text, init_db, get_conn, get_all_lists, get_list_tasks, add_task, delete_list,
-    mark_task_done, mark_task_done_fuzzy, delete_task, restore_task, find_list, fetch_task, fetch_list_by_task,
-    delete_task_fuzzy, delete_task_by_index, create_list, move_entity, get_all_tasks, update_user_profile,
-    get_user_profile, get_completed_tasks, get_deleted_tasks, search_tasks, update_task, update_task_by_index, restore_task_fuzzy
+    add_task,
+    create_list,
+    delete_list,
+    delete_task,
+    delete_task_by_index,
+    delete_task_fuzzy,
+    find_list,
+    fetch_list_by_task,
+    fetch_task,
+    get_all_lists,
+    get_all_tasks,
+    get_completed_tasks,
+    get_conn,
+    get_deleted_tasks,
+    get_list_tasks,
+    get_user_profile,
+    init_db,
+    mark_task_done,
+    mark_task_done_fuzzy,
+    move_entity,
+    normalize_text,
+    rename_list,
+    restore_task,
+    restore_task_fuzzy,
+    search_tasks,
+    update_task,
+    update_task_by_index,
+    update_user_profile,
 )
 dotenv_path = Path(__file__).resolve().parent / ".env"
 if dotenv_path.exists():
@@ -123,7 +169,7 @@ def set_ctx(user_id: int, **kw):
         else:
             sess[key] = value
     SESSION[user_id] = sess
-    logger.info(f"Updated context for user {user_id}: {sess}")
+    logger.info("Updated context for user %s: %s", user_id, sess)
 def get_ctx(user_id: int, key: str, default=None):
     return SESSION.get(
         user_id,
@@ -1395,7 +1441,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_text: str | None = None):
     user_id = update.effective_user.id
     text = (input_text or update.message.text or "").strip()
-    logger.info(f"📩 Text from {user_id}: {text}")
+    logger.info("📩 Text from %s: %s", user_id, text)
     try:
         conn = get_conn()
         history = get_ctx(user_id, "history", [])
@@ -1410,13 +1456,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
             pending_delete=get_ctx(user_id, "pending_delete", ""),
         )
         prompt = SEMANTIC_PROMPT.format_map(prompt_values)
-        logger.info(f"Sending to OpenAI: {text}")
+        logger.info("Dispatching text to OpenAI model '%s'", OPENAI_MODEL)
         try:
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": prompt},
-                    {"role": "user", "content": text}
+                    {"role": "user", "content": text},
                 ],
             )
         except AuthenticationError as auth_error:
@@ -1424,8 +1470,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
             await update.message.reply_text(
                 "⚠️ Ошибка авторизации OpenAI. Проверь API-ключ.")
             return
+        except (
+            APIConnectionError,
+            APIError,
+            APITimeoutError,
+            OpenAIError,
+            RateLimitError,
+        ) as api_error:
+            logger.error(
+                "OpenAI API error while processing message for user %s: %s",
+                user_id,
+                api_error,
+                exc_info=True,
+            )
+            await update.message.reply_text(
+                "⚠️ OpenAI временно недоступен. Попробуй ещё раз позже.")
+            await send_menu(update, context)
+            return
         raw = resp.choices[0].message.content.strip()
-        logger.info(f"🤖 RAW: {raw}")
+        logger.info("🤖 RAW response: %s", raw)
         try:
             with open(RAW_LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(f"\n=== RAW ({user_id}) ===\n{text}\n{raw}\n")
@@ -1450,7 +1513,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, input_
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"🎙 Voice from {user_id}")
+    logger.info("🎙 Voice from %s", user_id)
     try:
         vf = await update.message.voice.get_file()
         ogg = os.path.join(TEMP_DIR, f"{user_id}_voice.ogg")
@@ -1462,7 +1525,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             audio = r.record(src)
             text = r.recognize_google(audio, language="ru-RU")
             text = normalize_text(text)
-        logger.info(f"🗣 ASR: {text}")
+        logger.info("🗣 ASR transcript: %s", text)
         await update.message.reply_text(f"🗣 {text}")
         await handle_text(update, context, input_text=text)
         try:
