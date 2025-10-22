@@ -11,6 +11,23 @@ from typing import Any
 from Levenshtein import distance
 
 DB_PATH = os.getenv("DB_PATH", "/opt/aura-assistant/db.sqlite3")
+DB_DEBUG_PATH = os.getenv("DB_DEBUG_LOG", "/opt/aura-assistant/db_debug.log")
+
+_db_debug_dir = os.path.dirname(DB_DEBUG_PATH)
+if _db_debug_dir:
+    os.makedirs(_db_debug_dir, exist_ok=True)
+
+_sql_logger = logging.getLogger("aura.db.sql")
+if not _sql_logger.handlers:
+    _sql_logger.setLevel(logging.DEBUG)
+    _sql_handler = logging.FileHandler(DB_DEBUG_PATH, encoding="utf-8")
+    _sql_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+    _sql_logger.addHandler(_sql_handler)
+    _sql_logger.propagate = False
+
+
+def _trace_sql(statement: str) -> None:
+    _sql_logger.debug(statement)
 
 _TOKEN_STOPWORDS = {
     "и",
@@ -75,6 +92,22 @@ def _score_candidates(
     return best
 
 
+def _select_candidate(
+    pattern: str, candidates: Sequence[tuple[int, str, str]]
+) -> tuple[int, str, str] | None:
+    if not pattern:
+        return None
+    cleaned = re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ ]+", " ", pattern).strip()
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    for candidate in candidates:
+        _, title, _ = candidate
+        if title and title.strip().lower() == lowered:
+            return candidate
+    return _score_candidates(_tokenize(pattern), cleaned, candidates)
+
+
 def _load_meta(meta_text: str | None) -> dict[str, Any]:
     if not meta_text:
         return {}
@@ -95,7 +128,7 @@ def _get_list_id(conn: sqlite3.Connection, user_id: int, list_name: str) -> int 
     cur = conn.execute(
         """
         SELECT id FROM entities
-        WHERE user_id = ? AND type = 'list' AND title = ?
+        WHERE user_id = ? AND type = 'list' AND LOWER(title) = LOWER(?)
         LIMIT 1
         """,
         (user_id, list_name),
@@ -117,7 +150,9 @@ def _get_task_row(
         """
         SELECT id, title, meta
         FROM entities
-        WHERE user_id = ? AND type = 'task' AND parent_id = ? AND title = ?
+        WHERE user_id = ? AND type = 'task' AND parent_id = ?
+          AND LOWER(title) = LOWER(?)
+          AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE)
         LIMIT 1
         """,
         (user_id, list_id, title),
@@ -136,7 +171,7 @@ def _list_active_tasks(
         FROM entities
         WHERE user_id = ? AND type = 'task' AND parent_id = ?
           AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE)
-          AND json_extract(meta, '$.status') != 'done'
+          AND COALESCE(json_extract(meta, '$.status'), 'open') != 'done'
         ORDER BY created_at ASC
         """,
         (user_id, list_id),
@@ -181,6 +216,7 @@ def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.isolation_level = None
+    conn.set_trace_callback(_trace_sql)
     return conn
 
 def init_db() -> None:
@@ -238,7 +274,7 @@ def find_list(conn: sqlite3.Connection, user_id: int, list_name: str) -> sqlite3
             """
             SELECT id, title
             FROM entities
-            WHERE user_id = ? AND type = 'list' AND title = ?
+            WHERE user_id = ? AND type = 'list' AND LOWER(title) = LOWER(?)
             LIMIT 1
             """,
             (user_id, list_name),
@@ -267,9 +303,11 @@ def get_all_lists(conn: sqlite3.Connection, user_id: int) -> list[str]:
         return []
 
 def add_task(conn: sqlite3.Connection, user_id: int, list_name: str, title: str) -> int | None:
-    list_id = _get_list_id(conn, user_id, list_name)
-    if list_id is None:
+    list_row = find_list(conn, user_id, list_name)
+    if not list_row:
+        logging.info("Cannot add task '%s': list '%s' not found for user %s", title, list_name, user_id)
         return None
+    list_id = list_row["id"] if isinstance(list_row, sqlite3.Row) else list_row[0]
     existing_task = _get_task_row(conn, user_id, list_id, title)
     if existing_task:
         meta = _load_meta(existing_task["meta"])
@@ -280,10 +318,16 @@ def add_task(conn: sqlite3.Connection, user_id: int, list_name: str, title: str)
             user_id,
             meta,
         )
+        changed = False
+        if meta.pop("deleted", None):
+            changed = True
         if meta.get("status") == "done":
+            meta.pop("status", None)
+            changed = True
+        if changed:
             conn.execute(
-                "UPDATE entities SET meta = NULL WHERE id = ?",
-                (existing_task["id"],),
+                "UPDATE entities SET meta = ? WHERE id = ?",
+                (_dump_meta(meta), existing_task["id"]),
             )
             logging.info("Restored task '%s' in list '%s' for user %s", title, list_name, user_id)
             return existing_task["id"]
@@ -390,17 +434,29 @@ def mark_task_done(conn: sqlite3.Connection, user_id: int, list_name: str, task_
         list_id = _get_list_id(conn, user_id, list_name)
         if list_id is None:
             return 0
-        task_row = _get_task_row(conn, user_id, list_id, task_title)
-        if not task_row:
-            logging.info("No task '%s' found in list '%s' for user %s", task_title, list_name, user_id)
+        candidate_rows = list(_list_active_tasks(conn, user_id, list_id))
+        candidates = [(row["id"], row["title"], row["meta"]) for row in candidate_rows]
+        if not candidates:
+            logging.info("No active tasks found in list '%s' for user %s", list_name, user_id)
             return 0
-        meta = _load_meta(task_row["meta"])
+        chosen = _select_candidate(task_title, candidates)
+        if not chosen:
+            logging.info(
+                "No task matching '%s' found in list '%s' for user %s",
+                task_title,
+                list_name,
+                user_id,
+            )
+            return 0
+        chosen_id, chosen_title, meta_text = chosen
+        meta = _load_meta(meta_text)
         meta["status"] = "done"
+        meta.pop("deleted", None)
         conn.execute(
             "UPDATE entities SET meta = ? WHERE id = ?",
-            (_dump_meta(meta), task_row["id"]),
+            (_dump_meta(meta), chosen_id),
         )
-        logging.info("Marked task '%s' as done in list '%s' for user %s", task_title, list_name, user_id)
+        logging.info("Marked task '%s' as done in list '%s' for user %s", chosen_title, list_name, user_id)
         return 1
     except sqlite3.Error as exc:
         logging.error("SQLite error in mark_task_done: %s", exc)
@@ -438,6 +494,7 @@ def mark_task_done_fuzzy(
         chosen_id, chosen_title, meta_text = chosen
         meta = _load_meta(meta_text)
         meta["status"] = "done"
+        meta.pop("deleted", None)
         conn.execute(
             "UPDATE entities SET meta = ? WHERE id = ?",
             (_dump_meta(meta), chosen_id),
@@ -519,25 +576,41 @@ def restore_task(conn, user_id, list_name, task_title):
         list_id = _get_list_id(conn, user_id, list_name)
         if list_id is None:
             return 0
-        task_row = _get_task_row(conn, user_id, list_id, task_title)
-        if not task_row:
+        candidate_rows = list(_list_restorable_tasks(conn, user_id, list_id))
+        candidates = [(row["id"], row["title"], row["meta"]) for row in candidate_rows]
+        if not candidates:
+            logging.info("No restorable tasks in list '%s' for user %s", list_name, user_id)
+            return 0
+        chosen = _select_candidate(task_title, candidates)
+        if not chosen:
             logging.info(
-                "No task '%s' found in list '%s' for user %s, falling back to fuzzy",
+                "No restorable task matching '%s' in list '%s' for user %s",
                 task_title,
                 list_name,
                 user_id,
             )
-            restored, _ = restore_task_fuzzy(conn, user_id, list_name, task_title)
-            return 1 if restored else 0
-        meta = _load_meta(task_row["meta"])
-        meta["deleted"] = False
-        if "status" in meta:
-            meta["status"] = "open"
+            return 0
+        chosen_id, chosen_title, meta_text = chosen
+        meta = _load_meta(meta_text)
+        changed = False
+        if meta.pop("deleted", None):
+            changed = True
+        if meta.get("status") == "done":
+            meta.pop("status", None)
+            changed = True
+        if not changed:
+            logging.info(
+                "Task '%s' already active in list '%s' for user %s",
+                chosen_title,
+                list_name,
+                user_id,
+            )
+            return 0
         conn.execute(
             "UPDATE entities SET meta = ? WHERE id = ?",
-            (_dump_meta(meta), task_row["id"]),
+            (_dump_meta(meta), chosen_id),
         )
-        logging.info("Restored task '%s' in list '%s' for user %s", task_title, list_name, user_id)
+        logging.info("Restored task '%s' in list '%s' for user %s", chosen_title, list_name, user_id)
         return 1
     except sqlite3.Error as exc:
         logging.error("SQLite error in restore_task: %s", exc)
@@ -573,9 +646,20 @@ def restore_task_fuzzy(conn, user_id, list_name, pattern):
             return 0, None
         chosen_id, chosen_title, meta_text = chosen
         meta = _load_meta(meta_text)
-        meta["deleted"] = False
-        if "status" in meta:
-            meta["status"] = "open"
+        changed = False
+        if meta.pop("deleted", None):
+            changed = True
+        if meta.get("status") == "done":
+            meta.pop("status", None)
+            changed = True
+        if not changed:
+            logging.info(
+                "Task '%s' already active in list '%s' for user %s",
+                chosen_title,
+                list_name,
+                user_id,
+            )
+            return 0, None
         conn.execute(
             "UPDATE entities SET meta = ? WHERE id = ?",
             (_dump_meta(meta), chosen_id),
@@ -672,7 +756,9 @@ def fetch_task(conn: sqlite3.Connection, user_id: int, list_name: str, task_titl
             FROM entities e
             JOIN entities l ON l.id = e.parent_id
             WHERE e.user_id = ? AND e.type = 'task' AND l.type = 'list'
-              AND l.title = ? AND e.title = ?
+              AND LOWER(l.title) = LOWER(?)
+              AND LOWER(e.title) = LOWER(?)
+              AND (e.meta IS NULL OR json_extract(e.meta, '$.deleted') IS NOT TRUE)
             LIMIT 1
             """,
             (user_id, list_name, task_title),
