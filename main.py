@@ -1307,7 +1307,14 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                             matched = task_title
                             break
                     if matched:
-                        updated = move_entity(conn, user_id, entity_type, matched, obj["to_list"])
+                        updated = move_entity(
+                            conn,
+                            user_id,
+                            entity_type,
+                            matched,
+                            obj["list"],
+                            obj["to_list"],
+                        )
                         if updated:
                             action_icon = get_action_icon("move_entity")
                             header = f"{action_icon} Перемещено: *{matched}* → в {LIST_ICON} *{obj['to_list']}*"
@@ -1326,7 +1333,14 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     else:
                         await update.message.reply_text(f"⚠️ Задача *{title}* не найдена в *{obj['list']}*.")
                 else:
-                    updated = move_entity(conn, user_id, entity_type, title, obj["to_list"])
+                    updated = move_entity(
+                        conn,
+                        user_id,
+                        entity_type,
+                        title,
+                        obj["list"],
+                        obj["to_list"],
+                    )
                     if updated:
                         action_icon = get_action_icon("move_entity")
                         header = f"{action_icon} Перемещено: *{title}* → в {LIST_ICON} *{obj['to_list']}*"

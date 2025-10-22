@@ -906,22 +906,42 @@ def move_entity(
     to_list: str,
 ) -> int:
     try:
+        logging.info(
+            "Moving %s '%s' from '%s' to '%s' for user %s",
+            entity_type,
+            title,
+            from_list,
+            to_list,
+            user_id,
+        )
         from_list_id = _get_list_id(conn, user_id, from_list)
         if from_list_id is None:
+            logging.info("List '%s' not found for user %s", from_list, user_id)
             return 0
-        to_list_id = _get_or_create_list(conn, user_id, to_list)
+        to_list_id = _get_list_id(conn, user_id, to_list)
         if to_list_id is None:
+            logging.info("Target list '%s' not found for user %s", to_list, user_id)
             return 0
-        cur = conn.execute(
-            "SELECT id FROM entities WHERE user_id = ? AND type = ? AND title = ? AND parent_id = ? LIMIT 1",
-            (user_id, entity_type, title, from_list_id),
+        task_row = _get_task_row(conn, user_id, from_list_id, title)
+        if not task_row:
+            logging.info(
+                "No %s '%s' found in list '%s' for user %s",
+                entity_type,
+                title,
+                from_list,
+                user_id,
+            )
+            return 0
+        conn.execute(
+            "UPDATE entities SET parent_id = ? WHERE id = ?",
+            (to_list_id, task_row["id"]),
         )
-        entity = cur.fetchone()
-        if not entity:
-            logging.info("No %s '%s' found in list '%s' for user %s", entity_type, title, from_list, user_id)
-            return 0
-        conn.execute("UPDATE entities SET parent_id = ? WHERE id = ?", (to_list_id, entity["id"]))
-        logging.info("Moved %s '%s' from '%s' to '%s' for user %s", entity_type, title, from_list, to_list, user_id)
+        logging.info(
+            "✅ Task '%s' moved from '%s' to '%s'",
+            task_row["title"],
+            from_list,
+            to_list,
+        )
         return 1
     except sqlite3.Error as exc:
         logging.error("SQLite error in move_entity: %s", exc)
