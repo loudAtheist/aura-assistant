@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 import re
 from pathlib import Path
 from typing import Any
@@ -119,38 +120,132 @@ logger.info("OpenAI client initialized for model %s", OPENAI_MODEL)
 SESSION: dict[int, dict] = {} # { user_id: {"last_action": str, "last_list": str, "history": [str], "pending_delete": str, "pending_confirmation": dict} }
 SIGNIFICANT_ACTIONS = {"create", "add_task", "move_entity", "mark_done", "restore_task", "delete_task", "delete_list"}
 HISTORY_SKIP_ACTIONS = {"show_lists", "show_completed_tasks", "clarify", "confirm"}
-LIST_ICON = "📘"
-SECTION_ICON = "📋"
-ALL_LISTS_ICON = "🗂"
-ACTION_ICONS = {
-    "add_task": "🟢",
-    "create": "📘",
-    "delete_list": "🗑",
-    "delete_task": "🗑",
-    "mark_done": "✔️",
-    "move_entity": "🔄",
-    "rename_list": "🆕",
-    "restore_task": "♻️",
-    "update_task": "🔄",
-    "update_profile": "🆙",
+STYLE = os.getenv("AURA_STYLE", "minimal").strip().lower()
+if STYLE not in {"minimal", "vibrant"}:
+    STYLE = "minimal"
+
+TASK_EMOJI_MAP = {
+    "купить": "🛒",
+    "хлеб": "🥖",
+    "молоко": "🥛",
+    "сыр": "🧀",
+    "почистить": "🧽",
+    "мусор": "🗑",
+    "оплатить": "💰",
+    "лампочка": "💡",
+    "интернет": "🌐",
+    "отчет": "📄",
+    "проект": "📄",
+    "пациент": "🧍",
+    "встреча": "📞",
 }
+DEFAULT_TASK_EMOJI = "🧩"
+VIBRANT_ACCENTS = ["✨", "🔥", "⚡", "🌟"]
+STYLE_CONFIG = {
+    "minimal": {
+        "list_icon": "📘",
+        "section_icon": "📋",
+        "all_lists_icon": "🗂",
+        "action_icons": {
+            "add_task": "🟢",
+            "create": "📘",
+            "delete_list": "🗑",
+            "delete_task": "🗑",
+            "mark_done": "✔️",
+            "move_entity": "🔄",
+            "rename_list": "✏️",
+            "restore_task": "🌱",
+            "update_task": "✏️",
+            "update_profile": "🆙",
+        },
+    },
+    "vibrant": {
+        "list_icon": "🌈",
+        "section_icon": "🌈",
+        "all_lists_icon": "🌈",
+        "action_icons": {
+            "add_task": "🟢✨",
+            "create": "🪄",
+            "delete_list": "🗑️",
+            "delete_task": "🗑️",
+            "mark_done": "🎯",
+            "move_entity": "🚚",
+            "rename_list": "✏️",
+            "restore_task": "🌱",
+            "update_task": "✏️",
+            "update_profile": "🆙",
+        },
+    },
+}
+
+def _get_style_config() -> dict:
+    return STYLE_CONFIG.get(STYLE, STYLE_CONFIG["minimal"])
+
+
+LIST_ICON = _get_style_config()["list_icon"]
+SECTION_ICON = _get_style_config()["section_icon"]
+ALL_LISTS_ICON = _get_style_config()["all_lists_icon"]
+
+
 def get_action_icon(action: str) -> str:
-    return ACTION_ICONS.get(action, "✨")
+    config = _get_style_config()["action_icons"]
+    return config.get(action, "✨")
+
+
+def get_emoji_for_task(title: str | None) -> str:
+    if not title:
+        return DEFAULT_TASK_EMOJI
+    lowered = title.lower()
+    for keyword, emoji in TASK_EMOJI_MAP.items():
+        if keyword in lowered:
+            return emoji
+    return DEFAULT_TASK_EMOJI
+
+
+def _task_suffix(title: str) -> str:
+    emoji = get_emoji_for_task(title)
+    return f" {emoji}" if emoji else ""
+
+
+def format_task_line(index: int, title: str, style: str = STYLE) -> str:
+    suffix = _task_suffix(title)
+    if style == "vibrant":
+        accent = random.choice(VIBRANT_ACCENTS)
+        if suffix:
+            return f"{index}️⃣ {title}{suffix}{accent}"
+        return f"{index}️⃣ {title} {accent}"
+    return f"{index}. {title}{suffix}"
+
+
+def format_task_bullet(icon: str, title: str) -> str:
+    return f"{icon} {title}{_task_suffix(title)}"
+
+
+def format_section_title(title: str) -> str:
+    return f"{SECTION_ICON} {title}:"
 def format_list_output(conn, user_id: int, list_name: str, heading_label: str | None = None) -> str:
-    heading = heading_label or f"{SECTION_ICON} *{list_name}:*"
+    heading = heading_label or format_section_title(list_name)
     tasks = get_list_tasks(conn, user_id, list_name)
     if tasks:
-        lines = [f"{idx}. {title}" for idx, title in tasks]
+        lines = [format_task_line(idx, title) for idx, title in tasks]
     else:
         lines = ["_— пусто —_"]
-    return f"{heading} \n" + "\n".join(lines)
+    return f"{heading}\n" + "\n".join(lines)
+
+
 def show_all_lists(conn, user_id: int, heading_label: str | None = None) -> str:
-    heading = heading_label or f"{ALL_LISTS_ICON} *Твои списки:*"
     lists = get_all_lists(conn, user_id)
     if not lists:
-        return f"{heading} \n_— пусто —_"
-    body = "\n".join(f"{SECTION_ICON} {name}" for name in lists)
-    return f"{heading} \n{body}"
+        empty_message = f"{ALL_LISTS_ICON} Пока нет списков."
+        return f"{heading_label}\n_— пусто —_" if heading_label else empty_message
+    blocks = [
+        format_list_output(conn, user_id, name, heading_label=format_section_title(name))
+        for name in lists
+    ]
+    combined = "\n\n".join(blocks)
+    if heading_label:
+        return f"{heading_label}\n\n{combined}"
+    return combined
 def set_ctx(user_id: int, **kw):
     sess = SESSION.get(
         user_id,
@@ -841,7 +936,10 @@ async def perform_create_list(target: Any, conn, user_id: int, list_name: str, t
         logger.info(f"Creating list: {list_name}")
         create_list(conn, user_id, list_name)
         action_icon = get_action_icon("create")
-        header = f"{action_icon} Создан новый список {LIST_ICON} *{list_name}*."
+        if STYLE == "minimal":
+            header = f"{action_icon} Создан новый список {LIST_ICON} {list_name} ✨"
+        else:
+            header = f"{action_icon} Создан новый список: {list_name} ✨"
         details = None
         if tasks:
             added_tasks: list[str] = []
@@ -851,17 +949,17 @@ async def perform_create_list(target: Any, conn, user_id: int, list_name: str, t
                     added_tasks.append(task)
             if added_tasks:
                 add_icon = get_action_icon("add_task")
-                details = "\n".join(f"{add_icon} {task}" for task in added_tasks)
+                details = "\n".join(format_task_bullet(add_icon, task) for task in added_tasks)
             else:
-                details = f"⚠️ Задачи уже были в {LIST_ICON} *{list_name}*."
-        list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *Актуальный список:*")
+                details = f"⚠️ Задачи уже были в {LIST_ICON} {list_name}."
+        list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title("Актуальный список"))
         message_obj = getattr(target, "message", None)
         if message_obj is None:
             message_obj = target
         if details:
-            message = f"{header} \n{details}\n\n{list_block}"
+            message = f"{header}\n{details}\n\n{list_block}"
         else:
-            message = f"{header} \n\n{list_block}"
+            message = f"{header}\n\n{list_block}"
         await message_obj.reply_text(message, parse_mode="Markdown")
         set_ctx(user_id, last_action="create_list", last_list=list_name)
         return True
@@ -958,16 +1056,11 @@ async def expand_all_lists(update: Update, conn, user_id: int, context: ContextT
     lists = get_all_lists(conn, user_id)
     if not lists:
         await update.message.reply_text(
-            f"{ALL_LISTS_ICON} *Твои списки:* \n_— пусто —_",
+            f"{ALL_LISTS_ICON} Пока нет списков.",
             parse_mode="Markdown",
         )
         return
-    overview = "\n".join(f"{SECTION_ICON} {name}" for name in lists)
-    detailed_blocks = [
-        format_list_output(conn, user_id, name, heading_label=f"{SECTION_ICON} *{name}:*")
-        for name in lists
-    ]
-    message = f"{ALL_LISTS_ICON} *Твои списки:* \n{overview}\n\n" + "\n\n".join(detailed_blocks)
+    message = show_all_lists(conn, user_id)
     await update.message.reply_text(message, parse_mode="Markdown")
     set_ctx(user_id, last_action="show_lists")
 async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, actions: list, user_id: int, original_text: str) -> list[str]:
@@ -1057,12 +1150,16 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     if task_id:
                         added_tasks.append(t)
                 if added_tasks:
-                    details = "\n".join(f"{action_icon} {task}" for task in added_tasks)
-                    message_parts.append(f"{action_icon} Добавлены задачи в {LIST_ICON} *{list_name}:* \n{details}")
+                    details = "\n".join(format_task_bullet(action_icon, task) for task in added_tasks)
+                    if STYLE == "vibrant":
+                        header = f"{action_icon} Добавлено в {list_name}:"
+                    else:
+                        header = f"{action_icon} Добавлены задачи в {LIST_ICON} {list_name}:"
+                    message_parts.append(f"{header}\n{details}")
                 else:
-                    message_parts.append(f"⚠️ Все указанные задачи уже есть в {LIST_ICON} *{list_name}*.")
+                    message_parts.append(f"⚠️ Все указанные задачи уже есть в {LIST_ICON} {list_name}.")
                 if message_parts:
-                    list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *Актуальный список:*")
+                    list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title("Актуальный список"))
                     message_parts.append(list_block)
                     await update.message.reply_text("\n\n".join(message_parts), parse_mode="Markdown")
                 set_ctx(user_id, last_action="add_task", last_list=list_name)
@@ -1099,7 +1196,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     )
                     continue
                 items = get_list_tasks(conn, user_id, list_name)
-                message = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *{list_name}:*")
+                message = format_list_output(conn, user_id, list_name, heading_label=format_section_title(list_name))
                 await update.message.reply_text(message, parse_mode="Markdown")
                 set_ctx(user_id, last_action="show_tasks", last_list=list_name)
             except Exception as e:
@@ -1111,16 +1208,16 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 lists = get_all_lists(conn, user_id)
                 if not lists:
                     await update.message.reply_text(
-                        f"{ALL_LISTS_ICON} *Все твои дела:* \n_— пусто —_",
+                        f"{ALL_LISTS_ICON} Все задачи:\n_— пусто —_",
                         parse_mode="Markdown",
                     )
                     set_ctx(user_id, last_action="show_all_tasks")
                     continue
                 blocks = [
-                    format_list_output(conn, user_id, n, heading_label=f"{SECTION_ICON} *{n}:*")
+                    format_list_output(conn, user_id, n, heading_label=format_section_title(n))
                     for n in lists
                 ]
-                message = f"{ALL_LISTS_ICON} *Все твои дела:*\n\n" + "\n\n".join(blocks)
+                message = f"{ALL_LISTS_ICON} Все задачи:\n\n" + "\n\n".join(blocks)
                 await update.message.reply_text(message, parse_mode="Markdown")
                 set_ctx(user_id, last_action="show_all_tasks")
             except Exception as e:
@@ -1134,11 +1231,11 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     lines = []
                     for list_title, task_title in tasks:
                         list_display = list_title or "Архив"
-                        lines.append(f"✅ *{list_display}*: {task_title}")
-                    header = "✅ Выполненные задачи (последние 15):\n"
+                        lines.append(f"{list_display} — {task_title}{_task_suffix(task_title)}")
+                    header = f"{get_action_icon('mark_done')} Завершённые задачи (последние 15):\n"
                     await update.message.reply_text(header + "\n".join(lines), parse_mode="Markdown")
                 else:
-                    await update.message.reply_text("Пока нет выполненных задач 💤")
+                    await update.message.reply_text(f"{get_action_icon('mark_done')} Пока нет выполненных задач.")
                 set_ctx(user_id, last_action="show_completed_tasks")
             except Exception as e:
                 logger.exception(f"Show completed tasks error: {e}")
@@ -1151,11 +1248,11 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     lines = []
                     for list_title, task_title in tasks:
                         list_display = list_title or "Без списка"
-                        lines.append(f"🗑 *{list_display}*: {task_title}")
-                    header = "🗑 Удалённые задачи (последние 15):\n"
+                        lines.append(f"{list_display} — {task_title}{_task_suffix(task_title)}")
+                    header = f"{get_action_icon('delete_task')} Удалённые задачи (последние 15):\n"
                     await update.message.reply_text(header + "\n".join(lines), parse_mode="Markdown")
                 else:
-                    await update.message.reply_text("Пока нет удалённых задач ✨")
+                    await update.message.reply_text(f"{get_action_icon('delete_task')} Пока нет удалённых задач.")
                 set_ctx(user_id, last_action="show_deleted_tasks")
             except Exception as e:
                 logger.exception(f"Show deleted tasks error: {e}")
@@ -1165,10 +1262,17 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 logger.info(f"Searching tasks with pattern: {meta['pattern']}")
                 tasks = search_tasks(conn, user_id, meta["pattern"])
                 if tasks:
-                    txt = "🗂 Найденные задачи:\n"
+                    grouped: dict[str, list[str]] = {}
                     for list_title, task_title in tasks:
-                        txt += f"📋 *{list_title}*: {task_title}\n"
-                    await update.message.reply_text(txt, parse_mode="Markdown")
+                        list_display = list_title or "Без списка"
+                        grouped.setdefault(list_display, []).append(task_title)
+                    blocks = []
+                    for list_display, titles in grouped.items():
+                        heading = format_section_title(list_display)
+                        lines = [format_task_line(i, t) for i, t in enumerate(titles, start=1)]
+                        blocks.append(f"{heading}\n" + "\n".join(lines))
+                    message = f"{ALL_LISTS_ICON} Найденные задачи:\n\n" + "\n\n".join(blocks)
+                    await update.message.reply_text(message, parse_mode="Markdown")
                 else:
                     await update.message.reply_text(f"Задачи с '{meta['pattern']}' не найдены.")
                 set_ctx(user_id, last_action="search_entity")
@@ -1192,10 +1296,13 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 if deleted:
                     action_icon = get_action_icon("delete_task")
                     task_name = matched or title or "задача"
-                    header = f"{action_icon} Удалено из {LIST_ICON} *{ln}:*"
-                    details = f"{action_icon} {task_name}"
-                    list_block = format_list_output(conn, user_id, ln, heading_label=f"{SECTION_ICON} *{ln}:*")
-                    message = f"{header} \n{details}\n\n{list_block}"
+                    if STYLE == "vibrant":
+                        header = f"{action_icon} Удалено из {ln}:"
+                    else:
+                        header = f"{action_icon} Удалено из {LIST_ICON} {ln}:"
+                    details = format_task_bullet(action_icon, task_name)
+                    list_block = format_list_output(conn, user_id, ln, heading_label=format_section_title(ln))
+                    message = f"{header}\n{details}\n\n{list_block}"
                     await update.message.reply_text(message, parse_mode="Markdown")
                 else:
                     await update.message.reply_text("⚠️ Задача не найдена или уже выполнена.")
@@ -1210,8 +1317,8 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     logger.info(f"Deleting list: {list_name}")
                     deleted = delete_list(conn, user_id, list_name)
                     if deleted:
-                        remaining = show_all_lists(conn, user_id, heading_label=f"{ALL_LISTS_ICON} *Оставшиеся списки:*")
-                        message = f"{get_action_icon('delete_list')} Список *{list_name}* удалён. \n\n{remaining}"
+                        remaining = show_all_lists(conn, user_id, heading_label=f"{ALL_LISTS_ICON} Оставшиеся списки:")
+                        message = f"{get_action_icon('delete_list')} Список {list_name} удалён.\n\n{remaining}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                         set_ctx(user_id, last_action="delete_list", last_list=None, pending_delete=None)
                         executed_actions.append("delete_list")
@@ -1250,10 +1357,13 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                         completed_tasks.append(matched)
                 if completed_tasks:
                     action_icon = get_action_icon("mark_done")
-                    details = "\n".join(f"{action_icon} {task}" for task in completed_tasks)
-                    header = f"{action_icon} Готово в {LIST_ICON} *{list_name}:*"
-                    list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *{list_name}:*")
-                    message = f"{header} \n{details}\n\n{list_block}"
+                    details = "\n".join(format_task_bullet(action_icon, task) for task in completed_tasks)
+                    if STYLE == "vibrant":
+                        header = f"{action_icon} Готово в {list_name}:"
+                    else:
+                        header = f"{action_icon} Готово в {LIST_ICON} {list_name}:"
+                    list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title(list_name))
+                    message = f"{header}\n{details}\n\n{list_block}"
                     await update.message.reply_text(message, parse_mode="Markdown")
                     executed_actions.append("mark_done")
                 elif tasks_to_mark:
@@ -1263,10 +1373,13 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     deleted, matched = mark_task_done_fuzzy(conn, user_id, list_name, title)
                     if deleted:
                         action_icon = get_action_icon("mark_done")
-                        header = f"{action_icon} Готово в {LIST_ICON} *{list_name}:*"
-                        details = f"{action_icon} {matched}"
-                        list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *{list_name}:*")
-                        message = f"{header} \n{details}\n\n{list_block}"
+                        if STYLE == "vibrant":
+                            header = f"{action_icon} Готово в {list_name}:"
+                        else:
+                            header = f"{action_icon} Готово в {LIST_ICON} {list_name}:"
+                        details = format_task_bullet(action_icon, matched)
+                        list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title(list_name))
+                        message = f"{header}\n{details}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                         executed_actions.append("mark_done")
                     else:
@@ -1280,10 +1393,11 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 logger.info(f"Renaming list: {list_name} to {title}")
                 renamed = rename_list(conn, user_id, list_name, title)
                 if renamed:
-                    await update.message.reply_text(f"🆕 Список *{list_name}* переименован в *{title}*.", parse_mode="Markdown")
+                    icon = get_action_icon("rename_list")
+                    await update.message.reply_text(f"{icon} Список {list_name} переименован в {title}.", parse_mode="Markdown")
                     set_ctx(user_id, last_action="rename_list", last_list=title)
                 else:
-                    await update.message.reply_text(f"⚠️ Список *{list_name}* не найден или *{title}* уже существует.")
+                    await update.message.reply_text(f"⚠️ Список {list_name} не найден или {title} уже существует.")
             except Exception as e:
                 logger.exception(f"Rename list error: {e}")
                 await update.message.reply_text("⚠️ Не удалось переименовать список. Проверь логи.")
@@ -1317,14 +1431,17 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                         )
                         if updated:
                             action_icon = get_action_icon("move_entity")
-                            header = f"{action_icon} Перемещено: *{matched}* → в {LIST_ICON} *{obj['to_list']}*"
+                            target_label = obj["to_list"] if STYLE == "vibrant" else f"{LIST_ICON} {obj['to_list']}"
+                            header = (
+                                f"{action_icon} Перемещено: {matched} → в {target_label}{_task_suffix(matched)}"
+                            )
                             list_block = format_list_output(
                                 conn,
                                 user_id,
                                 obj["to_list"],
-                                heading_label=f"{SECTION_ICON} *{obj['to_list']}:*",
+                                heading_label=format_section_title(obj["to_list"]),
                             )
-                            message = f"{header} \n\n{list_block}"
+                            message = f"{header}\n\n{list_block}"
                             await update.message.reply_text(message, parse_mode="Markdown")
                             set_ctx(user_id, last_action="move_entity", last_list=obj["to_list"])
                             executed_actions.append("move_entity")
@@ -1343,14 +1460,17 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     )
                     if updated:
                         action_icon = get_action_icon("move_entity")
-                        header = f"{action_icon} Перемещено: *{title}* → в {LIST_ICON} *{obj['to_list']}*"
+                        target_label = obj["to_list"] if STYLE == "vibrant" else f"{LIST_ICON} {obj['to_list']}"
+                        header = (
+                            f"{action_icon} Перемещено: {title} → в {target_label}{_task_suffix(title)}"
+                        )
                         list_block = format_list_output(
                             conn,
                             user_id,
                             obj["to_list"],
-                            heading_label=f"{SECTION_ICON} *{obj['to_list']}:*",
+                            heading_label=format_section_title(obj["to_list"]),
                         )
-                        message = f"{header} \n\n{list_block}"
+                        message = f"{header}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                         set_ctx(user_id, last_action="move_entity", last_list=obj["to_list"])
                         executed_actions.append("move_entity")
@@ -1367,10 +1487,13 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     updated, old_title = update_task_by_index(conn, user_id, list_name, meta["by_index"], meta["new_title"])
                     if updated:
                         action_icon = get_action_icon("update_task")
-                        header = f"{action_icon} Обновлено в {LIST_ICON} *{list_name}:*"
-                        details = f"{action_icon} {old_title} → {meta['new_title']}"
-                        list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *{list_name}:*")
-                        message = f"{header} \n{details}\n\n{list_block}"
+                        if STYLE == "vibrant":
+                            header = f"{action_icon} Обновлено в {list_name}:"
+                        else:
+                            header = f"{action_icon} Обновлено в {LIST_ICON} {list_name}:"
+                        details = f"{action_icon} {old_title} → {meta['new_title']}{_task_suffix(meta['new_title'])}"
+                        list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title(list_name))
+                        message = f"{header}\n{details}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                     else:
                         await update.message.reply_text(f"⚠️ Не удалось изменить задачу по индексу {meta['by_index']} в списке *{list_name}*.")
@@ -1379,10 +1502,13 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     updated = update_task(conn, user_id, list_name, title, meta["new_title"])
                     if updated:
                         action_icon = get_action_icon("update_task")
-                        header = f"{action_icon} Обновлено в {LIST_ICON} *{list_name}:*"
-                        details = f"{action_icon} {title} → {meta['new_title']}"
-                        list_block = format_list_output(conn, user_id, list_name, heading_label=f"{SECTION_ICON} *{list_name}:*")
-                        message = f"{header} \n{details}\n\n{list_block}"
+                        if STYLE == "vibrant":
+                            header = f"{action_icon} Обновлено в {list_name}:"
+                        else:
+                            header = f"{action_icon} Обновлено в {LIST_ICON} {list_name}:"
+                        details = f"{action_icon} {title} → {meta['new_title']}{_task_suffix(meta['new_title'])}"
+                        list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title(list_name))
+                        message = f"{header}\n{details}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                     else:
                         await update.message.reply_text(f"⚠️ Не удалось изменить задачу *{title}* в списке *{list_name}*.")
@@ -1411,8 +1537,9 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     restored, matched, suggestion = restore_task(conn, user_id, list_name, title)
                 if restored:
                     resolved_title = matched or title
+                    icon = get_action_icon("restore_task")
                     await update.message.reply_text(
-                        f"🔄 Задача *{resolved_title}* восстановлена в списке *{list_name}*.",
+                        f"{icon} Задача {resolved_title} восстановлена в списке {list_name}.",
                         parse_mode="Markdown",
                     )
                 elif suggestion:
@@ -1447,8 +1574,13 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 logger.info(f"Showing tasks for list from text: {name_from_text}")
                 items = get_list_tasks(conn, user_id, name_from_text)
                 if items:
-                    txt = "\n".join([f"{i}. {t}" for i, t in items])
-                    await update.message.reply_text(f"📋 *{name_from_text}:*\n{txt}", parse_mode="Markdown")
+                    message = format_list_output(
+                        conn,
+                        user_id,
+                        name_from_text,
+                        heading_label=format_section_title(name_from_text),
+                    )
+                    await update.message.reply_text(message, parse_mode="Markdown")
                     set_ctx(user_id, last_action="show_tasks", last_list=name_from_text)
                     continue
                 await update.message.reply_text(f"Список *{name_from_text}* пуст или не существует.")
