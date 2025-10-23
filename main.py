@@ -958,16 +958,15 @@ def process_task_additions(
         force = force_first and idx == 0
         add_result = add_task(conn, user_id, list_name, raw_task, force=force)
         title_to_use = add_result.get("title") or raw_task
+        if add_result.get("duplicate_detected"):
+            similarity = add_result.get("similarity") or 0.0
+            logger.info(
+                'Duplicate detected: "%s" ≈ "%s" (similarity=%.2f)',
+                raw_task,
+                title_to_use,
+                similarity,
+            )
         if add_result.get("duplicate_detected") and not force:
-            if add_result.get("auto_use"):
-                results["auto_used"].append(
-                    {
-                        "requested": raw_task,
-                        "existing": title_to_use,
-                        "similarity": add_result.get("similarity"),
-                    }
-                )
-                continue
             results["duplicate"] = {
                 "list": list_name,
                 "requested": raw_task,
@@ -1022,14 +1021,37 @@ def compose_task_feedback(list_name: str, task_results: dict[str, Any]) -> list[
 
 def build_task_duplicate_question(list_name: str, duplicate_info: dict[str, Any]) -> str:
     existing = duplicate_info.get("existing") or ""
+    requested = duplicate_info.get("requested") or ""
+    if list_name:
+        return (
+            f"🤔 Похоже, уже есть похожая задача в списке “{list_name}”: “{existing}”."
+            f" Всё равно добавить “{requested}”? (да / нет)"
+        )
     return (
-        f"⚠️ Похоже, в списке “{list_name}” уже есть похожая задача: “{existing}”."
-        " Добавить всё равно?"
+        f"🤔 Похоже, уже есть похожая задача: “{existing}”."
+        f" Всё равно добавить “{requested}”? (да / нет)"
     )
-async def perform_create_list(target: Any, conn, user_id: int, list_name: str, tasks: list[str] | None = None) -> bool:
+
+
+def build_list_duplicate_question(requested: str, existing: str) -> str:
+    existing_clean = existing or ""
+    requested_clean = requested or ""
+    return (
+        f"🤔 Похоже, уже есть похожий список: “{existing_clean}”."
+        f" Всё равно создать “{requested_clean}”? (да / нет)"
+    )
+async def perform_create_list(
+    target: Any,
+    conn,
+    user_id: int,
+    list_name: str,
+    tasks: list[str] | None = None,
+    *,
+    force: bool = False,
+) -> bool:
     try:
         logger.info(f"Creating list: {list_name}")
-        result = create_list(conn, user_id, list_name)
+        result = create_list(conn, user_id, list_name, force=force)
         message_obj = getattr(target, "message", None)
         if message_obj is None:
             message_obj = target
@@ -1037,25 +1059,14 @@ async def perform_create_list(target: Any, conn, user_id: int, list_name: str, t
             existing_title = result.get("duplicate_title") or list_name
             similarity = result.get("similarity") or 0.0
             logger.info(
-                "Duplicate list candidate detected: '%s' vs '%s' (%.2f)",
+                'Duplicate detected: "%s" ≈ "%s" (similarity=%.2f)',
                 list_name,
                 existing_title,
                 similarity,
             )
-            logger.info(
-                "User asked to create “%s”, suggested using existing “%s”.",
-                list_name,
-                existing_title,
-            )
-            if result.get("auto_use"):
-                logger.info(
-                    "Auto-using existing list '%s' for request '%s' (%.2f)",
-                    existing_title,
-                    list_name,
-                    similarity,
-                )
+            if force:
                 message_parts = [
-                    f"⚠️ Похоже, такой список уже есть: “{existing_title}”. Использую его."
+                    f"⚠️ Список “{existing_title}” уже существует. Использую его."
                 ]
                 task_results = process_task_additions(conn, user_id, existing_title, tasks)
                 message_parts.extend(compose_task_feedback(existing_title, task_results))
@@ -1080,23 +1091,25 @@ async def perform_create_list(target: Any, conn, user_id: int, list_name: str, t
                     set_ctx(
                         user_id,
                         pending_confirmation={
-                            "type": "duplicate_task",
+                            "action": "add_task",
+                            "entity_type": "task",
                             "list": existing_title,
-                            "requested_title": duplicate_info.get("requested"),
-                            "existing_title": duplicate_info.get("existing"),
+                            "title": duplicate_info.get("requested"),
+                            "similar_to": duplicate_info.get("existing"),
                             "similarity": duplicate_info.get("similarity"),
                             "remaining_tasks": duplicate_info.get("remaining") or [],
                         },
                     )
                 return True
-            question = f"⚠️ Похоже, такой элемент уже есть: “{existing_title}”. Использовать его?"
+            question = build_list_duplicate_question(list_name, existing_title)
             await message_obj.reply_text(question)
             set_ctx(
                 user_id,
                 pending_confirmation={
-                    "type": "use_existing_list",
-                    "requested": list_name,
-                    "existing_title": existing_title,
+                    "action": "add_list",
+                    "entity_type": "list",
+                    "title": list_name,
+                    "similar_to": existing_title,
                     "similarity": similarity,
                     "tasks": tasks or [],
                 },
@@ -1131,10 +1144,11 @@ async def perform_create_list(target: Any, conn, user_id: int, list_name: str, t
             set_ctx(
                 user_id,
                 pending_confirmation={
-                    "type": "duplicate_task",
+                    "action": "add_task",
+                    "entity_type": "task",
                     "list": list_name,
-                    "requested_title": duplicate_info.get("requested"),
-                    "existing_title": duplicate_info.get("existing"),
+                    "title": duplicate_info.get("requested"),
+                    "similar_to": duplicate_info.get("existing"),
                     "similarity": duplicate_info.get("similarity"),
                     "remaining_tasks": duplicate_info.get("remaining") or [],
                 },
@@ -1171,6 +1185,100 @@ async def handle_pending_confirmation(
     normalized = response.strip().lower()
     is_yes = normalized in YES_ANSWERS
     is_no = normalized in NO_ANSWERS
+    action = pending_confirmation.get("action")
+    entity_type = pending_confirmation.get("entity_type")
+    conf_type = pending_confirmation.get("type")
+    if not action and conf_type == "duplicate_task":
+        pending_confirmation = {
+            "action": "add_task",
+            "entity_type": "task",
+            "list": pending_confirmation.get("list"),
+            "title": pending_confirmation.get("requested_title"),
+            "similar_to": pending_confirmation.get("existing_title"),
+            "similarity": pending_confirmation.get("similarity"),
+            "remaining_tasks": pending_confirmation.get("remaining_tasks"),
+        }
+        action = pending_confirmation.get("action")
+        entity_type = pending_confirmation.get("entity_type")
+    if action == "add_task" and entity_type == "task":
+        list_name = pending_confirmation.get("list") or get_ctx(user_id, "last_list")
+        if not list_name:
+            await message.reply_text("⚠️ Не понимаю, в какой список добавить задачу.")
+            set_ctx(user_id, pending_confirmation=None)
+            return None
+        if not is_yes:
+            await message.reply_text("Хорошо, не добавляю задачу.")
+            set_ctx(user_id, pending_confirmation=None)
+            return "cancel_duplicate_task"
+        requested = pending_confirmation.get("title")
+        remaining = pending_confirmation.get("remaining_tasks") or []
+        tasks_to_process: list[str] = []
+        if requested:
+            tasks_to_process.append(requested)
+        tasks_to_process.extend(remaining)
+        task_results = process_task_additions(
+            conn,
+            user_id,
+            list_name,
+            tasks_to_process,
+            force_first=True,
+        )
+        message_parts = compose_task_feedback(list_name, task_results)
+        list_block = format_list_output(
+            conn,
+            user_id,
+            list_name,
+            heading_label=format_section_title("Актуальный список"),
+        )
+        if message_parts:
+            message_parts.append(list_block)
+            await message.reply_text("\n\n".join(message_parts), parse_mode="Markdown")
+        else:
+            await message.reply_text(list_block, parse_mode="Markdown")
+        set_ctx(
+            user_id,
+            pending_confirmation=None,
+            last_list=list_name,
+            last_action="add_task",
+        )
+        duplicate_info = task_results.get("duplicate")
+        if duplicate_info:
+            question = build_task_duplicate_question(list_name, duplicate_info)
+            await message.reply_text(question)
+            set_ctx(
+                user_id,
+                pending_confirmation={
+                    "action": "add_task",
+                    "entity_type": "task",
+                    "list": list_name,
+                    "title": duplicate_info.get("requested"),
+                    "similar_to": duplicate_info.get("existing"),
+                    "similarity": duplicate_info.get("similarity"),
+                    "remaining_tasks": duplicate_info.get("remaining") or [],
+                },
+            )
+        return "add_task"
+    if action == "add_list" and entity_type == "list":
+        list_to_create = pending_confirmation.get("title")
+        if not list_to_create:
+            await message.reply_text("⚠️ Не понимаю, какой список создать.")
+            set_ctx(user_id, pending_confirmation=None)
+            return None
+        if not is_yes:
+            await message.reply_text("Хорошо, не создаю список.")
+            set_ctx(user_id, pending_confirmation=None)
+            return "cancel_create"
+        tasks = pending_confirmation.get("tasks") or []
+        set_ctx(user_id, pending_confirmation=None)
+        handled = await perform_create_list(
+            message,
+            conn,
+            user_id,
+            list_to_create,
+            tasks,
+            force=True,
+        )
+        return "create" if handled else None
     conf_type = pending_confirmation.get("type")
     if conf_type == "delete_tasks":
         if not is_yes:
@@ -1277,10 +1385,11 @@ async def handle_pending_confirmation(
             set_ctx(
                 user_id,
                 pending_confirmation={
-                    "type": "duplicate_task",
+                    "action": "add_task",
+                    "entity_type": "task",
                     "list": existing_title,
-                    "requested_title": duplicate_info.get("requested"),
-                    "existing_title": duplicate_info.get("existing"),
+                    "title": duplicate_info.get("requested"),
+                    "similar_to": duplicate_info.get("existing"),
                     "similarity": duplicate_info.get("similarity"),
                     "remaining_tasks": duplicate_info.get("remaining") or [],
                 },
@@ -1334,10 +1443,11 @@ async def handle_pending_confirmation(
             set_ctx(
                 user_id,
                 pending_confirmation={
-                    "type": "duplicate_task",
+                    "action": "add_task",
+                    "entity_type": "task",
                     "list": list_name,
-                    "requested_title": duplicate_info.get("requested"),
-                    "existing_title": duplicate_info.get("existing"),
+                    "title": duplicate_info.get("requested"),
+                    "similar_to": duplicate_info.get("existing"),
                     "similarity": duplicate_info.get("similarity"),
                     "remaining_tasks": duplicate_info.get("remaining") or [],
                 },
@@ -1477,10 +1587,11 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     set_ctx(
                         user_id,
                         pending_confirmation={
-                            "type": "duplicate_task",
+                            "action": "add_task",
+                            "entity_type": "task",
                             "list": list_name,
-                            "requested_title": duplicate_info.get("requested"),
-                            "existing_title": duplicate_info.get("existing"),
+                            "title": duplicate_info.get("requested"),
+                            "similar_to": duplicate_info.get("existing"),
                             "similarity": duplicate_info.get("similarity"),
                             "remaining_tasks": duplicate_info.get("remaining") or [],
                         },
