@@ -1,11 +1,14 @@
 import json
 import logging
+import math
 import os
 import random
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
+from dataclasses import dataclass
 from dotenv import load_dotenv
 from openai import (
     APIConnectionError,
@@ -112,7 +115,9 @@ emoji_logger = logging.getLogger("aura.emoji")
 if not emoji_logger.handlers:
     emoji_logger.setLevel(logging.INFO)
     aura_handler = logging.FileHandler(AURA_LOG_FILE, encoding="utf-8")
-    aura_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    aura_handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | aura | %(message)s")
+    )
     emoji_logger.addHandler(aura_handler)
     db_handler = logging.FileHandler(DB_DEBUG_LOG_FILE, encoding="utf-8")
     db_handler.setFormatter(logging.Formatter(LOG_FORMAT))
@@ -181,6 +186,9 @@ YES_ANSWERS = {"да", "yes"}
 NO_ANSWERS = {"нет", "no"}
 
 DEFAULT_TASK_EMOJI = "📎"
+NEUTRAL_EMOJI_POOL = ("🪶", "💫", "🌿", "🔹", "🕊")
+_LAST_TASK_EMOJI: str | None = None
+_NEUTRAL_POOL_INDEX = 0
 VIBRANT_ACCENTS = ["✨", "🔥", "⚡", "🌟"]
 STYLE_CONFIG = {
     "minimal": {
@@ -249,45 +257,156 @@ def codex_query(prompt: str) -> str:
     return (response.choices[0].message.content or "").strip()
 
 
-_EMOJI_CACHE: dict[str, str] = {}
+@dataclass(frozen=True)
+class EmojiDecision:
+    emoji: str
+    confidence: float
+    fallback: bool
 
 
-def get_emoji_by_semantics(title: str) -> str:
+_EMOJI_CACHE: dict[str, EmojiDecision] = {}
+
+
+def _describe_emoji_for_embedding(emoji: str) -> str | None:
+    names: list[str] = []
+    for char in emoji:
+        if char == "\ufe0f":
+            continue
+        if char == "\u200d":
+            continue
+        try:
+            names.append(unicodedata.name(char))
+        except ValueError:
+            continue
+    if not names:
+        return None
+    return " ".join(names).lower()
+
+
+def _cosine_similarity(vec1: list[float] | None, vec2: list[float] | None) -> float:
+    if not vec1 or not vec2:
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = math.sqrt(sum(a * a for a in vec1))
+    norm2 = math.sqrt(sum(b * b for b in vec2))
+    if not norm1 or not norm2:
+        return 0.0
+    similarity = dot / (norm1 * norm2)
+    if similarity < 0:
+        return 0.0
+    return min(similarity, 1.0)
+
+
+def _evaluate_emoji_confidence(title: str, emoji: str) -> float:
+    description = _describe_emoji_for_embedding(emoji)
+    if not description:
+        return 0.0
+    title_embedding = _get_text_embedding(title)
+    emoji_embedding = _get_text_embedding(description)
+    return _cosine_similarity(title_embedding, emoji_embedding)
+
+
+def _log_emoji_decision(
+    title: str,
+    emoji: str,
+    *,
+    confidence: float | None = None,
+    fallback: bool = False,
+    note: str | None = None,
+) -> None:
+    label = title if title else ""
+    if fallback:
+        if note:
+            emoji_logger.info("emoji['%s'] → %s (fallback: %s)", label, emoji, note)
+        else:
+            emoji_logger.info("emoji['%s'] → %s (fallback)", label, emoji)
+        return
+    if confidence is not None:
+        if note:
+            emoji_logger.info(
+                "emoji['%s'] → %s (confidence=%.2f, %s)",
+                label,
+                emoji,
+                confidence,
+                note,
+            )
+        else:
+            emoji_logger.info("emoji['%s'] → %s (confidence=%.2f)", label, emoji, confidence)
+        return
+    if note:
+        emoji_logger.info("emoji['%s'] → %s (%s)", label, emoji, note)
+        return
+    emoji_logger.info("emoji['%s'] → %s", label, emoji)
+
+
+def _next_neutral_emoji(exclude: str) -> str:
+    global _NEUTRAL_POOL_INDEX
+    for _ in range(len(NEUTRAL_EMOJI_POOL)):
+        candidate = NEUTRAL_EMOJI_POOL[_NEUTRAL_POOL_INDEX % len(NEUTRAL_EMOJI_POOL)]
+        _NEUTRAL_POOL_INDEX += 1
+        if candidate != exclude:
+            return candidate
+    return DEFAULT_TASK_EMOJI
+
+
+def _apply_repeat_protection(title: str, emoji: str) -> str:
+    global _LAST_TASK_EMOJI
+    if not emoji:
+        return emoji
+    if _LAST_TASK_EMOJI == emoji:
+        alternative = _next_neutral_emoji(emoji)
+        _LAST_TASK_EMOJI = alternative
+        _log_emoji_decision(title, alternative, fallback=False, note="neutral")
+        return alternative
+    _LAST_TASK_EMOJI = emoji
+    return emoji
+
+
+def get_emoji_by_semantics(title: str) -> EmojiDecision:
     """Запрашивает Semantic Core (LLM) для подбора эмодзи по смыслу текста."""
 
     normalized_title = title.strip()
     if not normalized_title:
-        emoji_logger.warning("⚠️ Emoji fallback for пустой запрос → %s", DEFAULT_TASK_EMOJI)
-        return DEFAULT_TASK_EMOJI
+        _log_emoji_decision(title, DEFAULT_TASK_EMOJI, fallback=True)
+        return EmojiDecision(DEFAULT_TASK_EMOJI, 0.0, True)
     try:
         prompt = (
             f"Подбери один уместный эмодзи, отражающий смысл фразы: '{normalized_title}'. Без текста, только эмодзи."
         )
         emoji = codex_query(prompt)
         if 0 < len(emoji) <= 4:
-            emoji_logger.info("🧠 Emoji suggestion for '%s' → %s", normalized_title, emoji)
-            return emoji
-        emoji_logger.warning("⚠️ Emoji fallback for '%s' → %s", normalized_title, DEFAULT_TASK_EMOJI)
+            confidence = _evaluate_emoji_confidence(normalized_title, emoji)
+            if confidence >= 0.6:
+                _log_emoji_decision(normalized_title, emoji, confidence=confidence)
+                return EmojiDecision(emoji, confidence, False)
+            _log_emoji_decision(
+                normalized_title,
+                DEFAULT_TASK_EMOJI,
+                fallback=True,
+                note=f"confidence={confidence:.2f}",
+            )
+            return EmojiDecision(DEFAULT_TASK_EMOJI, confidence, True)
+        _log_emoji_decision(normalized_title, DEFAULT_TASK_EMOJI, fallback=True, note="invalid")
     except Exception as e:
         logging.warning(f"Emoji generation failed for '{normalized_title}': {e}")
-        emoji_logger.warning("⚠️ Emoji fallback for '%s' → %s", normalized_title, DEFAULT_TASK_EMOJI)
-    return DEFAULT_TASK_EMOJI
+        _log_emoji_decision(normalized_title, DEFAULT_TASK_EMOJI, fallback=True, note="error")
+    return EmojiDecision(DEFAULT_TASK_EMOJI, 0.0, True)
 
 
-def get_emoji_cached(title: str | None) -> str:
+def get_emoji_cached(title: str | None) -> EmojiDecision:
     key_source = (title or "").strip()
-    if not key_source:
-        return DEFAULT_TASK_EMOJI
     cache_key = key_source.lower()
     if cache_key in _EMOJI_CACHE:
         return _EMOJI_CACHE[cache_key]
-    emoji = get_emoji_by_semantics(key_source)
-    _EMOJI_CACHE[cache_key] = emoji
-    return emoji
+    decision = get_emoji_by_semantics(key_source)
+    _EMOJI_CACHE[cache_key] = decision
+    return decision
 
 
 def _task_suffix(title: str | None) -> str:
-    emoji = get_emoji_cached(title)
+    decision = get_emoji_cached(title)
+    display_title = (title or "").strip()
+    emoji = _apply_repeat_protection(display_title, decision.emoji)
     return f" {emoji}" if emoji else ""
 
 
