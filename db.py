@@ -6,7 +6,7 @@ import os
 import re
 import sqlite3
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import Any, TypedDict
 
 from Levenshtein import distance
 
@@ -24,6 +24,18 @@ if not _sql_logger.handlers:
     _sql_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
     _sql_logger.addHandler(_sql_handler)
     _sql_logger.propagate = False
+
+_semantic_logger = logging.getLogger("semantic_similarity")
+if not _semantic_logger.handlers:
+    _semantic_logger.setLevel(logging.DEBUG)
+    _semantic_handler = logging.FileHandler(DB_DEBUG_PATH, encoding="utf-8")
+    _semantic_handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    )
+    _semantic_logger.addHandler(_semantic_handler)
+    _semantic_logger.propagate = False
+
+_app_logger = logging.getLogger("aura")
 
 
 def _trace_sql(statement: str) -> None:
@@ -47,9 +59,184 @@ _TOKEN_STOPWORDS = {
     "сделаны",
     "сделан",
 }
+
+_SEMANTIC_STOPWORDS = _TOKEN_STOPWORDS | {
+    "во",
+    "в",
+    "на",
+    "по",
+    "за",
+    "из",
+    "у",
+    "к",
+    "со",
+    "от",
+    "до",
+    "для",
+    "это",
+    "эта",
+    "этот",
+    "там",
+}
+
+_SEMANTIC_REPLACEMENTS = {
+    "оплатить": "платить",
+    "заплатить": "платить",
+    "оплата": "платить",
+    "платеж": "платить",
+    "квитанция": "платить",
+    "покупку": "покуп",
+    "покупка": "покуп",
+    "покупки": "покуп",
+    "купить": "покуп",
+    "электричество": "свет",
+    "электричества": "свет",
+    "электроэнергия": "свет",
+    "электроэнергию": "свет",
+    "свет": "свет",
+}
+
+_SEMANTIC_SUFFIXES = (
+    "иями",
+    "ями",
+    "ами",
+    "иях",
+    "ях",
+    "ев",
+    "ов",
+    "его",
+    "ого",
+    "ему",
+    "ому",
+    "ыми",
+    "ими",
+)
+
+
+class CreationResult(TypedDict, total=False):
+    id: int | None
+    title: str | None
+    created: bool
+    restored: bool
+    duplicate_detected: bool
+    duplicate_id: int | None
+    duplicate_title: str | None
+    similarity: float | None
+    auto_use: bool
+    missing_parent: bool
 def _tokenize(text: str) -> list[str]:
     parts = re.split(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", (text or "").lower())
     return [p for p in parts if p and p not in _TOKEN_STOPWORDS]
+
+
+def _normalize_semantic_token(token: str) -> str:
+    base = _SEMANTIC_REPLACEMENTS.get(token, token)
+    if len(base) > 4:
+        for suffix in _SEMANTIC_SUFFIXES:
+            if base.endswith(suffix) and len(base) - len(suffix) >= 4:
+                base = base[: -len(suffix)]
+                break
+    if len(base) > 4 and base[-1] in {"и", "ы", "а", "я", "е", "ю", "ь", "й"}:
+        base = base[:-1]
+    return base
+
+
+def _semantic_tokenize(text: str) -> list[str]:
+    normalized = re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", " ", (text or "").lower())
+    normalized = normalized.replace("ё", "е")
+    raw_tokens = [part for part in normalized.split() if part]
+    tokens: list[str] = []
+    for token in raw_tokens:
+        if token in _SEMANTIC_STOPWORDS:
+            continue
+        reduced = _normalize_semantic_token(token)
+        if reduced and reduced not in _SEMANTIC_STOPWORDS:
+            tokens.append(reduced)
+    return tokens
+
+
+def _creation_result(
+    *,
+    entity_id: int | None = None,
+    title: str | None = None,
+    created: bool = False,
+    restored: bool = False,
+    duplicate_detected: bool = False,
+    duplicate_id: int | None = None,
+    duplicate_title: str | None = None,
+    similarity: float | None = None,
+    auto_use: bool = False,
+    missing_parent: bool = False,
+) -> CreationResult:
+    return {
+        "id": entity_id,
+        "title": title,
+        "created": created,
+        "restored": restored,
+        "duplicate_detected": duplicate_detected,
+        "duplicate_id": duplicate_id,
+        "duplicate_title": duplicate_title,
+        "similarity": similarity,
+        "auto_use": auto_use,
+        "missing_parent": missing_parent,
+    }
+
+
+def _log_semantic_match(candidate: str, existing: str, score: float) -> None:
+    message = f"🔍 Found semantically similar: {existing} ≈ {candidate} ({score:.2f})"
+    _semantic_logger.info(message)
+    _app_logger.info("⚠️ Duplicate detected: %s ≈ %s (%.2f)", candidate, existing, score)
+
+
+def semantic_similarity(text_a: str | None, text_b: str | None) -> float:
+    tokens_a = set(_semantic_tokenize(text_a or ""))
+    tokens_b = set(_semantic_tokenize(text_b or ""))
+    union = tokens_a | tokens_b
+    if not union:
+        score = 0.0
+    else:
+        score = len(tokens_a & tokens_b) / len(union)
+    _semantic_logger.debug(
+        "Tokens(A): %s Tokens(B): %s → %.2f",
+        sorted(tokens_a),
+        sorted(tokens_b),
+        score,
+    )
+    return score
+
+
+def _find_semantic_duplicate(
+    conn: sqlite3.Connection,
+    user_id: int,
+    title: str,
+    entity_type: str,
+    *,
+    parent_id: int | None = None,
+    threshold: float = 0.75,
+) -> tuple[int, str, float] | None:
+    cleaned = (title or "").strip()
+    if not cleaned:
+        return None
+    params: list[Any] = [user_id, entity_type]
+    query = [
+        "SELECT id, title FROM entities",
+        "WHERE user_id = ? AND type = ?",
+        "AND (meta IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE)",
+    ]
+    if parent_id is not None:
+        query.append("AND parent_id = ?")
+        params.append(parent_id)
+    cur = conn.execute(" ".join(query), tuple(params))
+    best_match: tuple[int, str, float] | None = None
+    for row in cur.fetchall():
+        candidate_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+        candidate_title = row["title"] if isinstance(row, sqlite3.Row) else row[1]
+        score = semantic_similarity(cleaned, candidate_title)
+        if score > threshold and (best_match is None or score > best_match[2]):
+            best_match = (candidate_id, candidate_title, score)
+    if best_match:
+        _log_semantic_match(cleaned, best_match[1], best_match[2])
+    return best_match
 
 
 def _score_candidates(
@@ -248,8 +435,79 @@ def _get_or_create_list(conn: sqlite3.Connection, user_id: int, list_name: str) 
         raise
 
 
-def create_list(conn: sqlite3.Connection, user_id: int, list_name: str) -> int | None:
-    return _get_or_create_list(conn, user_id, list_name)
+def create_list(
+    conn: sqlite3.Connection,
+    user_id: int,
+    list_name: str,
+    *,
+    force: bool = False,
+) -> CreationResult:
+    cleaned_name = (list_name or "").strip()
+    if not cleaned_name:
+        logging.info("Empty list name received for user %s", user_id)
+        return _creation_result(title=list_name)
+    try:
+        if not force:
+            duplicate = _find_semantic_duplicate(
+                conn,
+                user_id,
+                cleaned_name,
+                "list",
+            )
+            if duplicate:
+                duplicate_id, duplicate_title, score = duplicate
+                logging.info(
+                    "Semantic duplicate detected for list '%s' -> '%s' (%.2f) for user %s",
+                    cleaned_name,
+                    duplicate_title,
+                    score,
+                    user_id,
+                )
+                return _creation_result(
+                    entity_id=duplicate_id,
+                    title=duplicate_title,
+                    duplicate_detected=True,
+                    duplicate_id=duplicate_id,
+                    duplicate_title=duplicate_title,
+                    similarity=score,
+                    auto_use=score >= 0.85,
+                )
+        cur = conn.execute(
+            """
+            INSERT INTO entities (user_id, type, title)
+            VALUES (?, 'list', ?)
+            """,
+            (user_id, cleaned_name),
+        )
+        list_id = cur.lastrowid
+        logging.info(
+            "Created list '%s' for user %s, ID: %s", cleaned_name, user_id, list_id
+        )
+        return _creation_result(entity_id=list_id, title=cleaned_name, created=True)
+    except sqlite3.IntegrityError:
+        existing_id = _get_list_id(conn, user_id, cleaned_name)
+        if existing_id is not None:
+            logging.info(
+                "List '%s' already exists for user %s, ID: %s", cleaned_name, user_id, existing_id
+            )
+            score = semantic_similarity(cleaned_name, cleaned_name)
+            _log_semantic_match(cleaned_name, cleaned_name, score)
+            return _creation_result(
+                entity_id=existing_id,
+                title=cleaned_name,
+                duplicate_detected=True,
+                duplicate_id=existing_id,
+                duplicate_title=cleaned_name,
+                similarity=1.0,
+                auto_use=True,
+            )
+        logging.error(
+            "IntegrityError: Failed to create list '%s' for user %s", cleaned_name, user_id
+        )
+        return _creation_result(title=cleaned_name)
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in create_list: %s", exc)
+        return _creation_result(title=cleaned_name)
 
 def rename_list(conn: sqlite3.Connection, user_id: int, old_name: str, new_name: str) -> int:
     try:
@@ -304,18 +562,31 @@ def get_all_lists(conn: sqlite3.Connection, user_id: int) -> list[str]:
         logging.error("SQLite error in get_all_lists: %s", exc)
         return []
 
-def add_task(conn: sqlite3.Connection, user_id: int, list_name: str, title: str) -> int | None:
+def add_task(
+    conn: sqlite3.Connection,
+    user_id: int,
+    list_name: str,
+    title: str,
+    *,
+    force: bool = False,
+) -> CreationResult:
     list_row = find_list(conn, user_id, list_name)
     if not list_row:
-        logging.info("Cannot add task '%s': list '%s' not found for user %s", title, list_name, user_id)
-        return None
+        logging.info(
+            "Cannot add task '%s': list '%s' not found for user %s",
+            title,
+            list_name,
+            user_id,
+        )
+        return _creation_result(title=title, missing_parent=True)
     list_id = list_row["id"] if isinstance(list_row, sqlite3.Row) else list_row[0]
     existing_task = _get_task_row(conn, user_id, list_id, title)
     if existing_task:
+        stored_title = existing_task["title"]
         meta = _load_meta(existing_task["meta"])
         logging.info(
             "Found existing task '%s' in list '%s' for user %s with meta: %s",
-            title,
+            stored_title,
             list_name,
             user_id,
             meta,
@@ -331,15 +602,63 @@ def add_task(conn: sqlite3.Connection, user_id: int, list_name: str, title: str)
                 "UPDATE entities SET meta = ? WHERE id = ?",
                 (_dump_meta(meta), existing_task["id"]),
             )
-            logging.info("Restored task '%s' in list '%s' for user %s", title, list_name, user_id)
-            return existing_task["id"]
+            logging.info(
+                "Restored task '%s' in list '%s' for user %s",
+                stored_title,
+                list_name,
+                user_id,
+            )
+            return _creation_result(
+                entity_id=existing_task["id"],
+                title=stored_title,
+                restored=True,
+            )
+        score = semantic_similarity(title, stored_title)
+        if score < 1.0:
+            score = 1.0
+        _log_semantic_match(title, stored_title, score)
         logging.info(
             "Task '%s' already exists and is not done in list '%s' for user %s",
-            title,
+            stored_title,
             list_name,
             user_id,
         )
-        return None
+        return _creation_result(
+            entity_id=existing_task["id"],
+            title=stored_title,
+            duplicate_detected=True,
+            duplicate_id=existing_task["id"],
+            duplicate_title=stored_title,
+            similarity=1.0,
+            auto_use=True,
+        )
+    if not force:
+        duplicate = _find_semantic_duplicate(
+            conn,
+            user_id,
+            title,
+            "task",
+            parent_id=list_id,
+        )
+        if duplicate:
+            duplicate_id, duplicate_title, score = duplicate
+            logging.info(
+                "Semantic duplicate detected for task '%s' -> '%s' (%.2f) in list '%s' for user %s",
+                title,
+                duplicate_title,
+                score,
+                list_name,
+                user_id,
+            )
+            return _creation_result(
+                entity_id=duplicate_id,
+                title=duplicate_title,
+                duplicate_detected=True,
+                duplicate_id=duplicate_id,
+                duplicate_title=duplicate_title,
+                similarity=score,
+                auto_use=score >= 0.85,
+            )
     try:
         cur = conn.execute(
             "INSERT INTO entities (user_id, type, title, parent_id) VALUES (?, 'task', ?, ?)",
@@ -347,7 +666,7 @@ def add_task(conn: sqlite3.Connection, user_id: int, list_name: str, title: str)
         )
         task_id = cur.lastrowid
         logging.info("Added new task '%s' to list '%s' for user %s", title, list_name, user_id)
-        return task_id
+        return _creation_result(entity_id=task_id, title=title, created=True)
     except sqlite3.IntegrityError as exc:
         logging.error(
             "IntegrityError: Failed to add task '%s' to list '%s' for user %s: %s",
@@ -356,7 +675,7 @@ def add_task(conn: sqlite3.Connection, user_id: int, list_name: str, title: str)
             user_id,
             exc,
         )
-        return None
+        return _creation_result(title=title)
 
 def update_task(conn: sqlite3.Connection, user_id: int, list_name: str, old_title: str, new_title: str) -> int:
     try:

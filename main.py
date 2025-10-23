@@ -124,6 +124,9 @@ STYLE = os.getenv("AURA_STYLE", "minimal").strip().lower()
 if STYLE not in {"minimal", "vibrant"}:
     STYLE = "minimal"
 
+YES_ANSWERS = {"да", "yes"}
+NO_ANSWERS = {"нет", "no"}
+
 TASK_EMOJI_MAP = {
     "купить": "🛒",
     "хлеб": "🥖",
@@ -931,37 +934,211 @@ def build_semantic_state(conn, user_id: int, history: list[str] | None = None) -
             for list_name, title in recent_tasks[:10]
         ]
     return db_state, session_state
+
+
+def process_task_additions(
+    conn,
+    user_id: int,
+    list_name: str,
+    tasks: list[str] | None,
+    *,
+    force_first: bool = False,
+) -> dict[str, Any]:
+    results: dict[str, Any] = {
+        "added": [],
+        "auto_used": [],
+        "duplicate": None,
+        "skipped": [],
+    }
+    if not tasks:
+        return results
+    for idx, raw_task in enumerate(tasks):
+        if not raw_task:
+            continue
+        force = force_first and idx == 0
+        add_result = add_task(conn, user_id, list_name, raw_task, force=force)
+        title_to_use = add_result.get("title") or raw_task
+        if add_result.get("duplicate_detected") and not force:
+            if add_result.get("auto_use"):
+                results["auto_used"].append(
+                    {
+                        "requested": raw_task,
+                        "existing": title_to_use,
+                        "similarity": add_result.get("similarity"),
+                    }
+                )
+                continue
+            results["duplicate"] = {
+                "list": list_name,
+                "requested": raw_task,
+                "existing": title_to_use,
+                "similarity": add_result.get("similarity"),
+                "remaining": tasks[idx + 1 :],
+            }
+            break
+        if add_result.get("created") or add_result.get("restored"):
+            results["added"].append(title_to_use)
+        elif add_result.get("duplicate_detected"):
+            results["auto_used"].append(
+                {
+                    "requested": raw_task,
+                    "existing": title_to_use,
+                    "similarity": add_result.get("similarity"),
+                }
+            )
+        else:
+            results["skipped"].append(raw_task)
+    return results
+
+
+def compose_task_feedback(list_name: str, task_results: dict[str, Any]) -> list[str]:
+    messages: list[str] = []
+    added = task_results.get("added") or []
+    if added:
+        icon = get_action_icon("add_task")
+        details = "\n".join(format_task_bullet(icon, task) for task in added)
+        if STYLE == "vibrant":
+            header = f"{icon} Добавлено в {list_name}:"
+        else:
+            header = f"{icon} Добавлены задачи в {LIST_ICON} {list_name}:"
+        messages.append(f"{header}\n{details}")
+    auto_used = task_results.get("auto_used") or []
+    if auto_used:
+        used_titles = [f"“{item['existing']}”" for item in auto_used]
+        messages.append(
+            "ℹ️ Эти задачи уже есть: "
+            + ", ".join(used_titles)
+            + ". Использую существующие."
+        )
+    if (
+        not added
+        and not auto_used
+        and not task_results.get("duplicate")
+        and task_results.get("skipped")
+    ):
+        messages.append(f"⚠️ Все указанные задачи уже есть в {LIST_ICON} {list_name}.")
+    return messages
+
+
+def build_task_duplicate_question(list_name: str, duplicate_info: dict[str, Any]) -> str:
+    existing = duplicate_info.get("existing") or ""
+    return (
+        f"⚠️ Похоже, в списке “{list_name}” уже есть похожая задача: “{existing}”."
+        " Добавить всё равно?"
+    )
 async def perform_create_list(target: Any, conn, user_id: int, list_name: str, tasks: list[str] | None = None) -> bool:
     try:
         logger.info(f"Creating list: {list_name}")
-        create_list(conn, user_id, list_name)
+        result = create_list(conn, user_id, list_name)
+        message_obj = getattr(target, "message", None)
+        if message_obj is None:
+            message_obj = target
+        if result.get("duplicate_detected"):
+            existing_title = result.get("duplicate_title") or list_name
+            similarity = result.get("similarity") or 0.0
+            logger.info(
+                "Duplicate list candidate detected: '%s' vs '%s' (%.2f)",
+                list_name,
+                existing_title,
+                similarity,
+            )
+            logger.info(
+                "User asked to create “%s”, suggested using existing “%s”.",
+                list_name,
+                existing_title,
+            )
+            if result.get("auto_use"):
+                logger.info(
+                    "Auto-using existing list '%s' for request '%s' (%.2f)",
+                    existing_title,
+                    list_name,
+                    similarity,
+                )
+                message_parts = [
+                    f"⚠️ Похоже, такой список уже есть: “{existing_title}”. Использую его."
+                ]
+                task_results = process_task_additions(conn, user_id, existing_title, tasks)
+                message_parts.extend(compose_task_feedback(existing_title, task_results))
+                list_block = format_list_output(
+                    conn,
+                    user_id,
+                    existing_title,
+                    heading_label=format_section_title("Актуальный список"),
+                )
+                message_parts.append(list_block)
+                await message_obj.reply_text("\n\n".join(message_parts), parse_mode="Markdown")
+                set_ctx(
+                    user_id,
+                    last_action="create_list",
+                    last_list=existing_title,
+                    pending_confirmation=None,
+                )
+                duplicate_info = task_results.get("duplicate")
+                if duplicate_info:
+                    question = build_task_duplicate_question(existing_title, duplicate_info)
+                    await message_obj.reply_text(question)
+                    set_ctx(
+                        user_id,
+                        pending_confirmation={
+                            "type": "duplicate_task",
+                            "list": existing_title,
+                            "requested_title": duplicate_info.get("requested"),
+                            "existing_title": duplicate_info.get("existing"),
+                            "similarity": duplicate_info.get("similarity"),
+                            "remaining_tasks": duplicate_info.get("remaining") or [],
+                        },
+                    )
+                return True
+            question = f"⚠️ Похоже, такой элемент уже есть: “{existing_title}”. Использовать его?"
+            await message_obj.reply_text(question)
+            set_ctx(
+                user_id,
+                pending_confirmation={
+                    "type": "use_existing_list",
+                    "requested": list_name,
+                    "existing_title": existing_title,
+                    "similarity": similarity,
+                    "tasks": tasks or [],
+                },
+            )
+            return False
         action_icon = get_action_icon("create")
         if STYLE == "minimal":
             header = f"{action_icon} Создан новый список {LIST_ICON} {list_name} ✨"
         else:
             header = f"{action_icon} Создан новый список: {list_name} ✨"
-        details = None
-        if tasks:
-            added_tasks: list[str] = []
-            for task in tasks:
-                task_id = add_task(conn, user_id, list_name, task)
-                if task_id:
-                    added_tasks.append(task)
-            if added_tasks:
-                add_icon = get_action_icon("add_task")
-                details = "\n".join(format_task_bullet(add_icon, task) for task in added_tasks)
-            else:
-                details = f"⚠️ Задачи уже были в {LIST_ICON} {list_name}."
-        list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title("Актуальный список"))
-        message_obj = getattr(target, "message", None)
-        if message_obj is None:
-            message_obj = target
-        if details:
-            message = f"{header}\n{details}\n\n{list_block}"
-        else:
-            message = f"{header}\n\n{list_block}"
-        await message_obj.reply_text(message, parse_mode="Markdown")
-        set_ctx(user_id, last_action="create_list", last_list=list_name)
+        task_results = process_task_additions(conn, user_id, list_name, tasks)
+        message_parts = [header]
+        message_parts.extend(compose_task_feedback(list_name, task_results))
+        list_block = format_list_output(
+            conn,
+            user_id,
+            list_name,
+            heading_label=format_section_title("Актуальный список"),
+        )
+        message_parts.append(list_block)
+        await message_obj.reply_text("\n\n".join(message_parts), parse_mode="Markdown")
+        set_ctx(
+            user_id,
+            last_action="create_list",
+            last_list=list_name,
+            pending_confirmation=None,
+        )
+        duplicate_info = task_results.get("duplicate")
+        if duplicate_info:
+            question = build_task_duplicate_question(list_name, duplicate_info)
+            await message_obj.reply_text(question)
+            set_ctx(
+                user_id,
+                pending_confirmation={
+                    "type": "duplicate_task",
+                    "list": list_name,
+                    "requested_title": duplicate_info.get("requested"),
+                    "existing_title": duplicate_info.get("existing"),
+                    "similarity": duplicate_info.get("similarity"),
+                    "remaining_tasks": duplicate_info.get("remaining") or [],
+                },
+            )
         return True
     except Exception as e:
         logger.exception(f"Create list error: {e}")
@@ -981,16 +1158,30 @@ def map_tasks_to_lists(conn, user_id: int, task_titles: list[str]) -> dict[str, 
             if raw_lower in items and original not in mapping:
                 mapping[original] = list_name
     return mapping
-async def handle_pending_confirmation(message, context: ContextTypes.DEFAULT_TYPE, conn, user_id: int, pending_confirmation: dict) -> bool:
+async def handle_pending_confirmation(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    conn,
+    user_id: int,
+    pending_confirmation: dict,
+    response: str,
+) -> str | None:
     if not pending_confirmation:
-        return False
+        return None
+    normalized = response.strip().lower()
+    is_yes = normalized in YES_ANSWERS
+    is_no = normalized in NO_ANSWERS
     conf_type = pending_confirmation.get("type")
     if conf_type == "delete_tasks":
+        if not is_yes:
+            await message.reply_text("Удаление отменено.")
+            set_ctx(user_id, pending_confirmation=None)
+            return "cancel_delete"
         tasks = pending_confirmation.get("tasks") or []
         if not tasks:
             await message.reply_text("⚠️ Нет задач для удаления.")
             set_ctx(user_id, pending_confirmation=None)
-            return False
+            return None
         base_list = pending_confirmation.get("list") or get_ctx(user_id, "last_list")
         task_to_list = {task: base_list for task in tasks if base_list}
         if not base_list:
@@ -1029,25 +1220,134 @@ async def handle_pending_confirmation(message, context: ContextTypes.DEFAULT_TYP
         else:
             await message.reply_text("⚠️ Не удалось обработать удаление задач.")
         set_ctx(user_id, pending_confirmation=None)
-        return bool(deleted_entries)
-    elif conf_type == "create_list":
+        return "delete_task" if deleted_entries else None
+    if conf_type == "create_list":
         list_to_create = pending_confirmation.get("list")
         if not list_to_create:
             await message.reply_text("⚠️ Не понимаю, какой список создать.")
             set_ctx(user_id, pending_confirmation=None)
-            return False
+            return None
+        if not is_yes:
+            await message.reply_text("Ок, не создаю список.")
+            set_ctx(user_id, pending_confirmation=None)
+            return "cancel_create"
         existing = find_list(conn, user_id, list_to_create)
         if existing:
-            await message.reply_text(f"⚠️ Список *{list_to_create}* уже существует.", parse_mode="Markdown")
+            await message.reply_text(
+                f"⚠️ Список *{list_to_create}* уже существует.",
+                parse_mode="Markdown",
+            )
             set_ctx(user_id, pending_confirmation=None, last_list=list_to_create)
-            return False
+            return None
         handled = await perform_create_list(message, conn, user_id, list_to_create)
         set_ctx(user_id, pending_confirmation=None)
-        return handled
-    else:
-        await message.reply_text("⚠️ Не удалось обработать подтверждение. Попробуй сформулировать команду заново.")
-        set_ctx(user_id, pending_confirmation=None)
-        return False
+        return "create" if handled else None
+    if conf_type == "use_existing_list":
+        existing_title = pending_confirmation.get("existing_title")
+        if not existing_title:
+            set_ctx(user_id, pending_confirmation=None)
+            await message.reply_text("⚠️ Не нашёл подходящий список.")
+            return None
+        if not is_yes:
+            await message.reply_text("Хорошо, скажи другое название списка.")
+            set_ctx(user_id, pending_confirmation=None)
+            return "cancel_use_existing_list"
+        tasks = pending_confirmation.get("tasks") or []
+        task_results = process_task_additions(conn, user_id, existing_title, tasks)
+        message_parts = [f"⚠️ Использую существующий список “{existing_title}”."]
+        message_parts.extend(compose_task_feedback(existing_title, task_results))
+        list_block = format_list_output(
+            conn,
+            user_id,
+            existing_title,
+            heading_label=format_section_title("Актуальный список"),
+        )
+        message_parts.append(list_block)
+        await message.reply_text("\n\n".join(message_parts), parse_mode="Markdown")
+        set_ctx(
+            user_id,
+            pending_confirmation=None,
+            last_list=existing_title,
+            last_action="create_list",
+        )
+        duplicate_info = task_results.get("duplicate")
+        if duplicate_info:
+            question = build_task_duplicate_question(existing_title, duplicate_info)
+            await message.reply_text(question)
+            set_ctx(
+                user_id,
+                pending_confirmation={
+                    "type": "duplicate_task",
+                    "list": existing_title,
+                    "requested_title": duplicate_info.get("requested"),
+                    "existing_title": duplicate_info.get("existing"),
+                    "similarity": duplicate_info.get("similarity"),
+                    "remaining_tasks": duplicate_info.get("remaining") or [],
+                },
+            )
+        return "use_existing_list"
+    if conf_type == "duplicate_task":
+        list_name = pending_confirmation.get("list") or get_ctx(user_id, "last_list")
+        if not list_name:
+            await message.reply_text("⚠️ Не понимаю, в какой список добавить задачу.")
+            set_ctx(user_id, pending_confirmation=None)
+            return None
+        if not is_yes:
+            await message.reply_text("Ок, не добавляю похожую задачу.")
+            set_ctx(user_id, pending_confirmation=None)
+            return "cancel_duplicate_task"
+        requested = pending_confirmation.get("requested_title")
+        remaining = pending_confirmation.get("remaining_tasks") or []
+        tasks_to_process = []
+        if requested:
+            tasks_to_process.append(requested)
+        tasks_to_process.extend(remaining)
+        task_results = process_task_additions(
+            conn,
+            user_id,
+            list_name,
+            tasks_to_process,
+            force_first=True,
+        )
+        message_parts = compose_task_feedback(list_name, task_results)
+        list_block = format_list_output(
+            conn,
+            user_id,
+            list_name,
+            heading_label=format_section_title("Актуальный список"),
+        )
+        if message_parts:
+            message_parts.append(list_block)
+            await message.reply_text("\n\n".join(message_parts), parse_mode="Markdown")
+        else:
+            await message.reply_text(list_block, parse_mode="Markdown")
+        set_ctx(
+            user_id,
+            pending_confirmation=None,
+            last_list=list_name,
+            last_action="add_task",
+        )
+        duplicate_info = task_results.get("duplicate")
+        if duplicate_info:
+            question = build_task_duplicate_question(list_name, duplicate_info)
+            await message.reply_text(question)
+            set_ctx(
+                user_id,
+                pending_confirmation={
+                    "type": "duplicate_task",
+                    "list": list_name,
+                    "requested_title": duplicate_info.get("requested"),
+                    "existing_title": duplicate_info.get("existing"),
+                    "similarity": duplicate_info.get("similarity"),
+                    "remaining_tasks": duplicate_info.get("remaining") or [],
+                },
+            )
+        return "add_task"
+    await message.reply_text(
+        "⚠️ Не удалось обработать подтверждение. Попробуй сформулировать команду заново."
+    )
+    set_ctx(user_id, pending_confirmation=None)
+    return None
 async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [["Показать списки", "Создать список"], ["Добавить задачу", "Помощь"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, selective=True)
@@ -1070,6 +1370,8 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
     normalized_actions = collapse_mark_done_actions(normalized_actions)
     executed_actions: list[str] = []
     pending_delete = get_ctx(user_id, "pending_delete")
+    pending_confirmation = get_ctx(user_id, "pending_confirmation")
+    normalized_reply = original_text.strip().lower()
     if original_text.lower() in ["да", "yes"] and pending_delete:
         try:
             logger.info(f"Deleting list: {pending_delete}")
@@ -1092,6 +1394,18 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
         await update.message.reply_text("Удаление отменено.")
         set_ctx(user_id, pending_delete=None)
         return executed_actions
+    if pending_confirmation and normalized_reply in YES_ANSWERS.union(NO_ANSWERS):
+        handled = await handle_pending_confirmation(
+            update.message,
+            context,
+            conn,
+            user_id,
+            pending_confirmation,
+            normalized_reply,
+        )
+        if handled:
+            executed_actions.append(handled)
+        return executed_actions
     for obj in normalized_actions:
         action = obj.get("action", "unknown")
         entity_type = obj.get("entity_type", "task")
@@ -1101,8 +1415,6 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
         logger.info(f"Action: {action}, Entity: {entity_type}, List: {list_name}, Title: {title}")
         if action not in ["delete_list", "clarify"] and get_ctx(user_id, "pending_delete"):
             set_ctx(user_id, pending_delete=None)
-        if action != "clarify" and get_ctx(user_id, "pending_confirmation"):
-            set_ctx(user_id, pending_confirmation=None)
         if list_name == "<последний список>":
             list_name = get_ctx(user_id, "last_list")
             logger.info(f"Resolved placeholder to last_list: {list_name}")
@@ -1139,31 +1451,51 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
         elif action == "add_task" and list_name:
             try:
                 logger.info(f"Adding tasks to list: {list_name}")
-                action_icon = get_action_icon("add_task")
-                message_parts = []
                 tasks = obj.get("tasks", []) or ([title] if title else [])
-                if not tasks:  # Если OpenAI не дал tasks, парсим из текста
+                if not tasks:
                     tasks = extract_task_list_from_command(original_text, list_name)
-                added_tasks = []
-                for t in tasks:
-                    task_id = add_task(conn, user_id, list_name, t)
-                    if task_id:
-                        added_tasks.append(t)
-                if added_tasks:
-                    details = "\n".join(format_task_bullet(action_icon, task) for task in added_tasks)
-                    if STYLE == "vibrant":
-                        header = f"{action_icon} Добавлено в {list_name}:"
-                    else:
-                        header = f"{action_icon} Добавлены задачи в {LIST_ICON} {list_name}:"
-                    message_parts.append(f"{header}\n{details}")
-                else:
-                    message_parts.append(f"⚠️ Все указанные задачи уже есть в {LIST_ICON} {list_name}.")
+                task_results = process_task_additions(conn, user_id, list_name, tasks)
+                message_parts = compose_task_feedback(list_name, task_results)
+                list_block = format_list_output(
+                    conn,
+                    user_id,
+                    list_name,
+                    heading_label=format_section_title("Актуальный список"),
+                )
                 if message_parts:
-                    list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title("Актуальный список"))
                     message_parts.append(list_block)
-                    await update.message.reply_text("\n\n".join(message_parts), parse_mode="Markdown")
+                    await update.message.reply_text(
+                        "\n\n".join(message_parts),
+                        parse_mode="Markdown",
+                    )
+                else:
+                    await update.message.reply_text(list_block, parse_mode="Markdown")
+                duplicate_info = task_results.get("duplicate")
+                if duplicate_info:
+                    question = build_task_duplicate_question(list_name, duplicate_info)
+                    await update.message.reply_text(question)
+                    set_ctx(
+                        user_id,
+                        pending_confirmation={
+                            "type": "duplicate_task",
+                            "list": list_name,
+                            "requested_title": duplicate_info.get("requested"),
+                            "existing_title": duplicate_info.get("existing"),
+                            "similarity": duplicate_info.get("similarity"),
+                            "remaining_tasks": duplicate_info.get("remaining") or [],
+                        },
+                    )
+                    logger.info(
+                        "Pending confirmation for duplicate task '%s' ≈ '%s' (%.2f) in list '%s'",
+                        duplicate_info.get("requested"),
+                        duplicate_info.get("existing"),
+                        duplicate_info.get("similarity"),
+                        list_name,
+                    )
+                    return executed_actions
                 set_ctx(user_id, last_action="add_task", last_list=list_name)
-                executed_actions.append("add_task")
+                if task_results.get("added") or task_results.get("auto_used"):
+                    executed_actions.append("add_task")
             except Exception as e:
                 logger.exception(f"Add task error: {e}")
                 await update.message.reply_text("⚠️ Не удалось добавить задачу. Проверь логи.")
@@ -1403,17 +1735,24 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 await update.message.reply_text("⚠️ Не удалось переименовать список. Проверь логи.")
         elif action == "move_entity" and entity_type and title and obj.get("list") and obj.get("to_list"):
             try:
-                logger.info(f"Moving {entity_type} '{title}' from {obj['list']} to {obj['to_list']}")
+                target_list_name = obj["to_list"]
+                logger.info(f"Moving {entity_type} '{title}' from {obj['list']} to {target_list_name}")
                 list_exists = find_list(conn, user_id, obj["list"])
-                to_list_exists = find_list(conn, user_id, obj["to_list"])
+                to_list_exists = find_list(conn, user_id, target_list_name)
                 if not list_exists:
                     await update.message.reply_text(f"⚠️ Список *{obj['list']}* не найден.")
                     continue
                 if not to_list_exists:
-                    logger.info(f"Creating target list '{obj['to_list']}' for user {user_id}")
-                    create_list(conn, user_id, obj["to_list"])
+                    logger.info(f"Creating target list '{target_list_name}' for user {user_id}")
+                    create_result = create_list(conn, user_id, target_list_name)
+                    if create_result.get("duplicate_detected"):
+                        target_list_name = create_result.get("duplicate_title") or target_list_name
+                        logger.info(
+                            "Using existing list '%s' for move instead of creating new",
+                            target_list_name,
+                        )
                 if meta.get("fuzzy"):
-                    logger.info(f"Moving task fuzzy: {title} from {obj['list']} to {obj['to_list']}")
+                    logger.info(f"Moving task fuzzy: {title} from {obj['list']} to {target_list_name}")
                     tasks = get_list_tasks(conn, user_id, obj["list"])
                     matched = None
                     for _, task_title in tasks:
@@ -1427,23 +1766,27 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                             entity_type,
                             matched,
                             obj["list"],
-                            obj["to_list"],
+                            target_list_name,
                         )
                         if updated:
                             action_icon = get_action_icon("move_entity")
-                            target_label = obj["to_list"] if STYLE == "vibrant" else f"{LIST_ICON} {obj['to_list']}"
+                            target_label = (
+                                target_list_name
+                                if STYLE == "vibrant"
+                                else f"{LIST_ICON} {target_list_name}"
+                            )
                             header = (
                                 f"{action_icon} Перемещено: {matched} → в {target_label}{_task_suffix(matched)}"
                             )
                             list_block = format_list_output(
                                 conn,
                                 user_id,
-                                obj["to_list"],
-                                heading_label=format_section_title(obj["to_list"]),
+                                target_list_name,
+                                heading_label=format_section_title(target_list_name),
                             )
                             message = f"{header}\n\n{list_block}"
                             await update.message.reply_text(message, parse_mode="Markdown")
-                            set_ctx(user_id, last_action="move_entity", last_list=obj["to_list"])
+                            set_ctx(user_id, last_action="move_entity", last_list=target_list_name)
                             executed_actions.append("move_entity")
                         else:
                             await update.message.reply_text(f"⚠️ Не удалось переместить *{matched}*. Проверь, есть ли такая задача.")
@@ -1456,23 +1799,27 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                         entity_type,
                         title,
                         obj["list"],
-                        obj["to_list"],
+                        target_list_name,
                     )
                     if updated:
                         action_icon = get_action_icon("move_entity")
-                        target_label = obj["to_list"] if STYLE == "vibrant" else f"{LIST_ICON} {obj['to_list']}"
+                        target_label = (
+                            target_list_name
+                            if STYLE == "vibrant"
+                            else f"{LIST_ICON} {target_list_name}"
+                        )
                         header = (
                             f"{action_icon} Перемещено: {title} → в {target_label}{_task_suffix(title)}"
                         )
                         list_block = format_list_output(
                             conn,
                             user_id,
-                            obj["to_list"],
-                            heading_label=format_section_title(obj["to_list"]),
+                            target_list_name,
+                            heading_label=format_section_title(target_list_name),
                         )
                         message = f"{header}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
-                        set_ctx(user_id, last_action="move_entity", last_list=obj["to_list"])
+                        set_ctx(user_id, last_action="move_entity", last_list=target_list_name)
                         executed_actions.append("move_entity")
                     else:
                         await update.message.reply_text(f"⚠️ Не удалось переместить *{title}*. Проверь, есть ли такая задача.")
