@@ -61,6 +61,7 @@ from db import (
     update_task,
     update_task_by_index,
     update_user_profile,
+    set_embedding_provider,
 )
 dotenv_path = Path(__file__).resolve().parent / ".env"
 if dotenv_path.exists():
@@ -116,6 +117,44 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 logger.debug("Temporary directory ready at %s", TEMP_DIR)
 logger.info("OpenAI client initialized for model %s", OPENAI_MODEL)
+
+_EMBEDDING_MODEL = "text-embedding-3-small"
+_EMBEDDING_CACHE: dict[str, list[float]] = {}
+
+
+def _normalize_embedding_text(text: str) -> str:
+    normalized = (text or "").strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.lower()
+
+
+def _get_text_embedding(text: str) -> list[float] | None:
+    normalized = _normalize_embedding_text(text)
+    if not normalized:
+        return None
+    if normalized in _EMBEDDING_CACHE:
+        return _EMBEDDING_CACHE[normalized]
+    try:
+        response = client.embeddings.create(
+            model=_EMBEDDING_MODEL,
+            input=normalized,
+        )
+    except (
+        APIConnectionError,
+        APIError,
+        APITimeoutError,
+        AuthenticationError,
+        OpenAIError,
+        RateLimitError,
+    ) as exc:
+        logger.error("Failed to compute embedding for '%s': %s", normalized, exc)
+        return None
+    embedding = response.data[0].embedding
+    _EMBEDDING_CACHE[normalized] = embedding
+    return embedding
+
+
+set_embedding_provider(_get_text_embedding)
 # ========= DIALOG CONTEXT (per-user) =========
 SESSION: dict[int, dict] = {} # { user_id: {"last_action": str, "last_list": str, "history": [str], "pending_delete": str, "pending_confirmation": dict} }
 SIGNIFICANT_ACTIONS = {"create", "add_task", "move_entity", "mark_done", "restore_task", "delete_task", "delete_list"}

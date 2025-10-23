@@ -5,7 +5,8 @@ import logging
 import os
 import re
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from math import sqrt
 from typing import Any, TypedDict
 
 from Levenshtein import distance
@@ -36,6 +37,30 @@ if not _semantic_logger.handlers:
     _semantic_logger.propagate = False
 
 _app_logger = logging.getLogger("aura")
+
+
+def set_embedding_provider(
+    provider: Callable[[str], Sequence[float] | None]
+) -> None:
+    """Register a callable that returns an embedding vector for the given text."""
+
+    global _embedding_provider
+    _embedding_provider = provider
+
+
+def _cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
+    if not vec_a or not vec_b:
+        return 0.0
+    if len(vec_a) != len(vec_b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(vec_a, vec_b))
+    norm_a = sqrt(sum(x * x for x in vec_a))
+    norm_b = sqrt(sum(y * y for y in vec_b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+_embedding_provider: Callable[[str], Sequence[float] | None] | None = None
 
 
 def _trace_sql(statement: str) -> None:
@@ -188,7 +213,7 @@ def _log_semantic_match(candidate: str, existing: str, score: float) -> None:
     _app_logger.info("⚠️ Duplicate detected: %s ≈ %s (%.2f)", candidate, existing, score)
 
 
-def semantic_similarity(text_a: str | None, text_b: str | None) -> float:
+def _legacy_semantic_similarity(text_a: str | None, text_b: str | None) -> float:
     tokens_a = set(_semantic_tokenize(text_a or ""))
     tokens_b = set(_semantic_tokenize(text_b or ""))
     union = tokens_a | tokens_b
@@ -205,6 +230,43 @@ def semantic_similarity(text_a: str | None, text_b: str | None) -> float:
     return score
 
 
+def semantic_similarity(text_a: str | None, text_b: str | None) -> float:
+    cleaned_a = (text_a or "").strip()
+    cleaned_b = (text_b or "").strip()
+    if not cleaned_a or not cleaned_b:
+        score = 0.0
+        _app_logger.info(
+            'Semantic similarity between "%s" and "%s" = %.2f',
+            cleaned_a,
+            cleaned_b,
+            score,
+        )
+        return score
+
+    score: float | None = None
+    if _embedding_provider is not None:
+        try:
+            embedding_a = _embedding_provider(cleaned_a)
+            embedding_b = _embedding_provider(cleaned_b)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logging.exception("Embedding provider failed: %s", exc)
+            embedding_a = None
+            embedding_b = None
+        if embedding_a and embedding_b:
+            score = _cosine_similarity(embedding_a, embedding_b)
+
+    if score is None:
+        score = _legacy_semantic_similarity(cleaned_a, cleaned_b)
+
+    _app_logger.info(
+        'Semantic similarity between "%s" and "%s" = %.2f',
+        cleaned_a,
+        cleaned_b,
+        score,
+    )
+    return score
+
+
 def _find_semantic_duplicate(
     conn: sqlite3.Connection,
     user_id: int,
@@ -212,7 +274,7 @@ def _find_semantic_duplicate(
     entity_type: str,
     *,
     parent_id: int | None = None,
-    threshold: float = 0.75,
+    threshold: float = 0.83,
 ) -> tuple[int, str, float] | None:
     cleaned = (title or "").strip()
     if not cleaned:
