@@ -75,6 +75,9 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 RUN_LOG_FILE = LOG_DIR / "aura_run.log"
 ERROR_LOG_FILE = LOG_DIR / "codex_errors.log"
 RAW_LOG_FILE = LOG_DIR / "openai_raw.log"
+AURA_LOG_FILE = LOG_DIR / "aura.log"
+DB_DEBUG_LOG_FILE = Path(os.getenv("DB_DEBUG_LOG", "/opt/aura-assistant/db_debug.log"))
+DB_DEBUG_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 logger = logging.getLogger("aura")
@@ -104,6 +107,17 @@ logging.captureWarnings(True)
 logger.debug("Logging configured: console + %s, %s", RUN_LOG_FILE, ERROR_LOG_FILE)
 
 getattr(logger, _dotenv_message[0])(_dotenv_message[1])
+
+emoji_logger = logging.getLogger("aura.emoji")
+if not emoji_logger.handlers:
+    emoji_logger.setLevel(logging.INFO)
+    aura_handler = logging.FileHandler(AURA_LOG_FILE, encoding="utf-8")
+    aura_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    emoji_logger.addHandler(aura_handler)
+    db_handler = logging.FileHandler(DB_DEBUG_LOG_FILE, encoding="utf-8")
+    db_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    emoji_logger.addHandler(db_handler)
+    emoji_logger.propagate = False
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -166,22 +180,7 @@ if STYLE not in {"minimal", "vibrant"}:
 YES_ANSWERS = {"да", "yes"}
 NO_ANSWERS = {"нет", "no"}
 
-TASK_EMOJI_MAP = {
-    "купить": "🛒",
-    "хлеб": "🥖",
-    "молоко": "🥛",
-    "сыр": "🧀",
-    "почистить": "🧽",
-    "мусор": "🗑",
-    "оплатить": "💰",
-    "лампочка": "💡",
-    "интернет": "🌐",
-    "отчет": "📄",
-    "проект": "📄",
-    "пациент": "🧍",
-    "встреча": "📞",
-}
-DEFAULT_TASK_EMOJI = "🧩"
+DEFAULT_TASK_EMOJI = "📎"
 VIBRANT_ACCENTS = ["✨", "🔥", "⚡", "🌟"]
 STYLE_CONFIG = {
     "minimal": {
@@ -234,18 +233,61 @@ def get_action_icon(action: str) -> str:
     return config.get(action, "✨")
 
 
-def get_emoji_for_task(title: str | None) -> str:
-    if not title:
+def codex_query(prompt: str) -> str:
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "Ты — Aura Semantic Core. Подбирай уместный эмодзи и отвечай только им.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=8,
+        temperature=0.2,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+_EMOJI_CACHE: dict[str, str] = {}
+
+
+def get_emoji_by_semantics(title: str) -> str:
+    """Запрашивает Semantic Core (LLM) для подбора эмодзи по смыслу текста."""
+
+    normalized_title = title.strip()
+    if not normalized_title:
+        emoji_logger.warning("⚠️ Emoji fallback for пустой запрос → %s", DEFAULT_TASK_EMOJI)
         return DEFAULT_TASK_EMOJI
-    lowered = title.lower()
-    for keyword, emoji in TASK_EMOJI_MAP.items():
-        if keyword in lowered:
+    try:
+        prompt = (
+            f"Подбери один уместный эмодзи, отражающий смысл фразы: '{normalized_title}'. Без текста, только эмодзи."
+        )
+        emoji = codex_query(prompt)
+        if 0 < len(emoji) <= 4:
+            emoji_logger.info("🧠 Emoji suggestion for '%s' → %s", normalized_title, emoji)
             return emoji
+        emoji_logger.warning("⚠️ Emoji fallback for '%s' → %s", normalized_title, DEFAULT_TASK_EMOJI)
+    except Exception as e:
+        logging.warning(f"Emoji generation failed for '{normalized_title}': {e}")
+        emoji_logger.warning("⚠️ Emoji fallback for '%s' → %s", normalized_title, DEFAULT_TASK_EMOJI)
     return DEFAULT_TASK_EMOJI
 
 
-def _task_suffix(title: str) -> str:
-    emoji = get_emoji_for_task(title)
+def get_emoji_cached(title: str | None) -> str:
+    key_source = (title or "").strip()
+    if not key_source:
+        return DEFAULT_TASK_EMOJI
+    cache_key = key_source.lower()
+    if cache_key in _EMOJI_CACHE:
+        return _EMOJI_CACHE[cache_key]
+    emoji = get_emoji_by_semantics(key_source)
+    _EMOJI_CACHE[cache_key] = emoji
+    return emoji
+
+
+def _task_suffix(title: str | None) -> str:
+    emoji = get_emoji_cached(title)
     return f" {emoji}" if emoji else ""
 
 
