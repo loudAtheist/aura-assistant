@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,7 @@ from db import (
     update_task,
     update_task_by_index,
     update_user_profile,
+    DB_DEBUG_PATH,
 )
 dotenv_path = Path(__file__).resolve().parent / ".env"
 if dotenv_path.exists():
@@ -124,22 +126,7 @@ STYLE = os.getenv("AURA_STYLE", "minimal").strip().lower()
 if STYLE not in {"minimal", "vibrant"}:
     STYLE = "minimal"
 
-TASK_EMOJI_MAP = {
-    "купить": "🛒",
-    "хлеб": "🥖",
-    "молоко": "🥛",
-    "сыр": "🧀",
-    "почистить": "🧽",
-    "мусор": "🗑",
-    "оплатить": "💰",
-    "лампочка": "💡",
-    "интернет": "🌐",
-    "отчет": "📄",
-    "проект": "📄",
-    "пациент": "🧍",
-    "встреча": "📞",
-}
-DEFAULT_TASK_EMOJI = "🧩"
+DEFAULT_TASK_EMOJI = "📎"
 VIBRANT_ACCENTS = ["✨", "🔥", "⚡", "🌟"]
 STYLE_CONFIG = {
     "minimal": {
@@ -178,6 +165,81 @@ STYLE_CONFIG = {
     },
 }
 
+AURA_LOG_FILE = LOG_DIR / "aura.log"
+DB_DEBUG_FILE = Path(DB_DEBUG_PATH)
+_EMOJI_CACHE: dict[str, str] = {}
+
+
+def _log_emoji_event(message: str) -> None:
+    logger.info(message)
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    log_line = f"{timestamp} | {message}"
+    for path in (AURA_LOG_FILE, DB_DEBUG_FILE):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as log_file:
+                log_file.write(log_line + "\n")
+        except Exception as exc:
+            logger.debug("Failed to write emoji log to %s: %s", path, exc, exc_info=True)
+
+
+def codex_query(prompt: str) -> str:
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "Ты Aura Semantic Core. Подбирай только один уместный эмодзи по смыслу текста.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=12,
+        temperature=0.2,
+    )
+    return response.choices[0].message.content or ""
+
+
+def get_emoji_by_semantics(title: str) -> str:
+    """
+    Запрашивает Semantic Core (LLM) для подбора эмодзи по смыслу текста.
+    Возвращает один эмодзи без текста.
+    """
+
+    cleaned_title = (title or "").strip()
+    if not cleaned_title:
+        emoji = DEFAULT_TASK_EMOJI
+        _log_emoji_event(f"⚠️ Emoji fallback for '{title}' → {emoji}")
+        return emoji
+    try:
+        prompt = (
+            f"Подбери один уместный эмодзи, отражающий смысл фразы: '{cleaned_title}'. Без текста, только эмодзи."
+        )
+        emoji = codex_query(prompt).strip()
+        if 0 < len(emoji) <= 4:
+            _log_emoji_event(f"🧠 Emoji suggestion for '{cleaned_title}' → {emoji}")
+            return emoji
+        logger.warning("Emoji generation produced invalid response for '%s': %s", cleaned_title, emoji)
+    except Exception as exc:
+        logger.warning("Emoji generation failed for '%s': %s", cleaned_title, exc)
+    emoji = DEFAULT_TASK_EMOJI
+    _log_emoji_event(f"⚠️ Emoji fallback for '{cleaned_title}' → {emoji}")
+    return emoji
+
+
+def get_emoji_cached(title: str) -> str:
+    normalized = (title or "").strip()
+    if not normalized:
+        emoji = DEFAULT_TASK_EMOJI
+        _log_emoji_event(f"⚠️ Emoji fallback for '{title}' → {emoji}")
+        return emoji
+    cache_key = normalized.lower()
+    if cache_key in _EMOJI_CACHE:
+        return _EMOJI_CACHE[cache_key]
+    emoji = get_emoji_by_semantics(normalized)
+    _EMOJI_CACHE[cache_key] = emoji
+    return emoji
+
+
 def _get_style_config() -> dict:
     return STYLE_CONFIG.get(STYLE, STYLE_CONFIG["minimal"])
 
@@ -192,33 +254,16 @@ def get_action_icon(action: str) -> str:
     return config.get(action, "✨")
 
 
-def get_emoji_for_task(title: str | None) -> str:
-    if not title:
-        return DEFAULT_TASK_EMOJI
-    lowered = title.lower()
-    for keyword, emoji in TASK_EMOJI_MAP.items():
-        if keyword in lowered:
-            return emoji
-    return DEFAULT_TASK_EMOJI
-
-
-def _task_suffix(title: str) -> str:
-    emoji = get_emoji_for_task(title)
-    return f" {emoji}" if emoji else ""
-
-
 def format_task_line(index: int, title: str, style: str = STYLE) -> str:
-    suffix = _task_suffix(title)
+    emoji = get_emoji_cached(title)
     if style == "vibrant":
         accent = random.choice(VIBRANT_ACCENTS)
-        if suffix:
-            return f"{index}️⃣ {title}{suffix}{accent}"
-        return f"{index}️⃣ {title} {accent}"
-    return f"{index}. {title}{suffix}"
+        return f"{index}️⃣ {title} {emoji}{accent}"
+    return f"{index}. {title} {emoji}"
 
 
 def format_task_bullet(icon: str, title: str) -> str:
-    return f"{icon} {title}{_task_suffix(title)}"
+    return f"{icon} {title} {get_emoji_cached(title)}"
 
 
 def format_section_title(title: str) -> str:
@@ -1231,7 +1276,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     lines = []
                     for list_title, task_title in tasks:
                         list_display = list_title or "Архив"
-                        lines.append(f"{list_display} — {task_title}{_task_suffix(task_title)}")
+                        lines.append(f"{list_display} — {task_title} {get_emoji_cached(task_title)}")
                     header = f"{get_action_icon('mark_done')} Завершённые задачи (последние 15):\n"
                     await update.message.reply_text(header + "\n".join(lines), parse_mode="Markdown")
                 else:
@@ -1248,7 +1293,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     lines = []
                     for list_title, task_title in tasks:
                         list_display = list_title or "Без списка"
-                        lines.append(f"{list_display} — {task_title}{_task_suffix(task_title)}")
+                        lines.append(f"{list_display} — {task_title} {get_emoji_cached(task_title)}")
                     header = f"{get_action_icon('delete_task')} Удалённые задачи (последние 15):\n"
                     await update.message.reply_text(header + "\n".join(lines), parse_mode="Markdown")
                 else:
@@ -1433,7 +1478,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                             action_icon = get_action_icon("move_entity")
                             target_label = obj["to_list"] if STYLE == "vibrant" else f"{LIST_ICON} {obj['to_list']}"
                             header = (
-                                f"{action_icon} Перемещено: {matched} → в {target_label}{_task_suffix(matched)}"
+                                f"{action_icon} Перемещено: {matched} → в {target_label} {get_emoji_cached(matched)}"
                             )
                             list_block = format_list_output(
                                 conn,
@@ -1462,7 +1507,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                         action_icon = get_action_icon("move_entity")
                         target_label = obj["to_list"] if STYLE == "vibrant" else f"{LIST_ICON} {obj['to_list']}"
                         header = (
-                            f"{action_icon} Перемещено: {title} → в {target_label}{_task_suffix(title)}"
+                            f"{action_icon} Перемещено: {title} → в {target_label} {get_emoji_cached(title)}"
                         )
                         list_block = format_list_output(
                             conn,
@@ -1491,7 +1536,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                             header = f"{action_icon} Обновлено в {list_name}:"
                         else:
                             header = f"{action_icon} Обновлено в {LIST_ICON} {list_name}:"
-                        details = f"{action_icon} {old_title} → {meta['new_title']}{_task_suffix(meta['new_title'])}"
+                        details = f"{action_icon} {old_title} → {meta['new_title']} {get_emoji_cached(meta['new_title'])}"
                         list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title(list_name))
                         message = f"{header}\n{details}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
@@ -1506,7 +1551,7 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                             header = f"{action_icon} Обновлено в {list_name}:"
                         else:
                             header = f"{action_icon} Обновлено в {LIST_ICON} {list_name}:"
-                        details = f"{action_icon} {title} → {meta['new_title']}{_task_suffix(meta['new_title'])}"
+                        details = f"{action_icon} {title} → {meta['new_title']} {get_emoji_cached(meta['new_title'])}"
                         list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title(list_name))
                         message = f"{header}\n{details}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
