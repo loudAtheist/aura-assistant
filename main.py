@@ -50,7 +50,9 @@ from db import (
     get_completed_tasks,
     get_conn,
     get_deleted_tasks,
+    get_entity_meta,
     get_list_tasks,
+    get_list_meta,
     get_user_profile,
     init_db,
     mark_task_done,
@@ -61,6 +63,7 @@ from db import (
     restore_task,
     restore_task_fuzzy,
     search_tasks,
+    set_entity_meta,
     update_task,
     update_task_by_index,
     update_user_profile,
@@ -178,57 +181,174 @@ set_embedding_provider(_get_text_embedding)
 SESSION: dict[int, dict] = {} # { user_id: {"last_action": str, "last_list": str, "history": [str], "pending_delete": str, "pending_confirmation": dict} }
 SIGNIFICANT_ACTIONS = {"create", "add_task", "move_entity", "mark_done", "restore_task", "delete_task", "delete_list"}
 HISTORY_SKIP_ACTIONS = {"show_lists", "show_completed_tasks", "clarify", "confirm"}
-STYLE = os.getenv("AURA_STYLE", "minimal").strip().lower()
-if STYLE not in {"minimal", "vibrant"}:
-    STYLE = "minimal"
+_visual_style_env = os.getenv("VISUAL_STYLE")
+if not _visual_style_env:
+    _visual_style_env = os.getenv("AURA_STYLE")
+_visual_style_key = (_visual_style_env or "MINIMAL").strip().upper()
+_LEGACY_STYLE_MAP = {
+    "MINIMAL": "MINIMAL",
+    "MINIMALIST": "MINIMAL",
+    "SOFT": "SOFT",
+    "SOFT-TOUCH": "SOFT",
+    "SOFT_TOUCH": "SOFT",
+    "CHAT": "CHAT_FRIENDLY",
+    "CHAT-FRIENDLY": "CHAT_FRIENDLY",
+    "CHAT_FRIENDLY": "CHAT_FRIENDLY",
+    "FRIENDLY": "CHAT_FRIENDLY",
+    "VIBRANT": "VIBRANT",
+    "VIVID": "VIBRANT",
+    "BRIGHT": "VIBRANT",
+}
+VISUAL_STYLE = _LEGACY_STYLE_MAP.get(_visual_style_key, _visual_style_key)
+_VALID_VISUAL_STYLES = {"MINIMAL", "SOFT", "CHAT_FRIENDLY", "VIBRANT"}
+if VISUAL_STYLE not in _VALID_VISUAL_STYLES:
+    VISUAL_STYLE = "MINIMAL"
 
 YES_ANSWERS = {"да", "yes"}
 NO_ANSWERS = {"нет", "no"}
 
+DEFAULT_LIST_EMOJI = "📘"
 DEFAULT_TASK_EMOJI = "📎"
 NEUTRAL_EMOJI_POOL = ("🪶", "💫", "🌿", "🔹", "🕊")
 _LAST_TASK_EMOJI: str | None = None
 _NEUTRAL_POOL_INDEX = 0
 VIBRANT_ACCENTS = ["✨", "🔥", "⚡", "🌟"]
+SEMANTIC_GROUP_CATALOG: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "🏠",
+        (
+            "дом",
+            "домаш",
+            "убор",
+            "ремонт",
+            "семь",
+            "кварт",
+            "сад",
+            "кухн",
+        ),
+    ),
+    (
+        "💼",
+        (
+            "работ",
+            "офис",
+            "проект",
+            "meeting",
+            "совещ",
+            "коллег",
+            "deadline",
+        ),
+    ),
+    (
+        "🛒",
+        (
+            "куп",
+            "магаз",
+            "продук",
+            "заказ",
+            "доставка",
+            "товар",
+        ),
+    ),
+    (
+        "📚",
+        (
+            "учеб",
+            "курс",
+            "урок",
+            "лекц",
+            "читать",
+            "книга",
+            "экзам",
+            "изуч",
+        ),
+    ),
+    (
+        "💪",
+        (
+            "спорт",
+            "трен",
+            "бег",
+            "йога",
+            "заряд",
+            "фитнес",
+        ),
+    ),
+)
 STYLE_CONFIG = {
-    "minimal": {
+    "MINIMAL": {
         "list_icon": "📘",
         "section_icon": "📋",
         "all_lists_icon": "🗂",
         "action_icons": {
-            "add_task": "🟢",
+            "add_task": "➕",
             "create": "📘",
             "delete_list": "🗑",
             "delete_task": "🗑",
             "mark_done": "✔️",
             "move_entity": "🔄",
             "rename_list": "✏️",
-            "restore_task": "🌱",
+            "restore_task": "♻️",
             "update_task": "✏️",
             "update_profile": "🆙",
         },
     },
-    "vibrant": {
+    "SOFT": {
+        "list_icon": "📙",
+        "section_icon": "🪄",
+        "all_lists_icon": "🪄",
+        "action_icons": {
+            "add_task": "➕",
+            "create": "🌤️",
+            "delete_list": "🧺",
+            "delete_task": "🧺",
+            "mark_done": "✅",
+            "move_entity": "🔁",
+            "rename_list": "🖋️",
+            "restore_task": "♻️",
+            "update_task": "🖋️",
+            "update_profile": "🪴",
+        },
+    },
+    "CHAT_FRIENDLY": {
+        "list_icon": "💬",
+        "section_icon": "💬",
+        "all_lists_icon": "🧾",
+        "action_icons": {
+            "add_task": "➕",
+            "create": "🗒️",
+            "delete_list": "🗑",
+            "delete_task": "🗑",
+            "mark_done": "☑️",
+            "move_entity": "📤",
+            "rename_list": "✏️",
+            "restore_task": "♻️",
+            "update_task": "✏️",
+            "update_profile": "💬",
+        },
+    },
+    "VIBRANT": {
         "list_icon": "🌈",
         "section_icon": "🌈",
         "all_lists_icon": "🌈",
         "action_icons": {
-            "add_task": "🟢✨",
+            "add_task": "➕✨",
             "create": "🪄",
             "delete_list": "🗑️",
             "delete_task": "🗑️",
             "mark_done": "🎯",
             "move_entity": "🚚",
             "rename_list": "✏️",
-            "restore_task": "🌱",
+            "restore_task": "♻️",
             "update_task": "✏️",
             "update_profile": "🆙",
         },
     },
 }
 
+
 def _get_style_config() -> dict:
-    return STYLE_CONFIG.get(STYLE, STYLE_CONFIG["minimal"])
+    return STYLE_CONFIG.get(VISUAL_STYLE, STYLE_CONFIG["MINIMAL"])
 
 
 LIST_ICON = _get_style_config()["list_icon"]
@@ -247,7 +367,10 @@ def codex_query(prompt: str) -> str:
         messages=[
             {
                 "role": "system",
-                "content": "Ты — Aura Semantic Core. Подбирай уместный эмодзи и отвечай только им.",
+                "content": (
+                    "Ты — Aura Semantic Core. Подбирай уместные эмодзи и отвечай только ими. "
+                    "Используй один или два эмодзи, разделяя их пробелом."
+                ),
             },
             {"role": "user", "content": prompt},
         ],
@@ -306,6 +429,84 @@ def _evaluate_emoji_confidence(title: str, emoji: str) -> float:
     return _cosine_similarity(title_embedding, emoji_embedding)
 
 
+def _evaluate_multi_emoji_confidence(title: str, emojis: list[str]) -> float:
+    if not emojis:
+        return 0.0
+    scores = [_evaluate_emoji_confidence(title, item) for item in emojis]
+    non_zero = [score for score in scores if score > 0]
+    if not non_zero:
+        return max(scores) if scores else 0.0
+    return sum(non_zero) / len(non_zero)
+
+
+def _split_candidate_emojis(raw: str) -> list[str]:
+    if not raw:
+        return []
+    cleaned = raw.strip()
+    if not cleaned:
+        return []
+    normalized = cleaned.replace(",", " ")
+    tokens = [token for token in re.split(r"\s+", normalized) if token]
+    filtered: list[str] = []
+    for token in tokens:
+        if any(ch.isalnum() for ch in token):
+            continue
+        filtered.append(token)
+        if len(filtered) >= 2:
+            break
+    if not filtered and cleaned and not any(ch.isalnum() for ch in cleaned):
+        filtered = [cleaned]
+    return filtered[:2]
+
+
+def _detect_semantic_group(title: str) -> str | None:
+    lowered = (title or "").lower()
+    if not lowered:
+        return None
+    for emoji, keywords in SEMANTIC_GROUP_CATALOG:
+        for keyword in keywords:
+            if keyword in lowered:
+                return emoji
+    return None
+
+
+def _fallback_emoji_for_entity(title: str, entity_type: str) -> tuple[str, str]:
+    group_emoji = _detect_semantic_group(title)
+    if group_emoji:
+        return group_emoji, "group"
+    if entity_type == "list":
+        return DEFAULT_LIST_EMOJI, "default"
+    return DEFAULT_TASK_EMOJI, "default"
+
+
+def _emoji_meta_payload(decision: EmojiDecision) -> dict[str, Any]:
+    return {
+        "value": decision.emoji,
+        "confidence": decision.confidence,
+        "fallback": decision.fallback,
+    }
+
+
+def _extract_meta_emoji(meta: dict[str, Any] | None) -> EmojiDecision | None:
+    if not meta:
+        return None
+    payload = meta.get("emoji")
+    if isinstance(payload, dict):
+        value = payload.get("value") or ""
+        if not value:
+            return None
+        confidence_raw = payload.get("confidence")
+        try:
+            confidence_val = float(confidence_raw) if confidence_raw is not None else 0.0
+        except (TypeError, ValueError):
+            confidence_val = 0.0
+        fallback_flag = bool(payload.get("fallback"))
+        return EmojiDecision(value, confidence_val, fallback_flag)
+    if isinstance(payload, str) and payload.strip():
+        return EmojiDecision(payload.strip(), 0.0, False)
+    return None
+
+
 def _log_emoji_decision(
     title: str,
     emoji: str,
@@ -316,27 +517,23 @@ def _log_emoji_decision(
 ) -> None:
     label = title if title else ""
     if fallback:
+        base = "emoji['%s'] -> %s" % (label, emoji)
         if note:
-            emoji_logger.info("emoji['%s'] → %s (fallback: %s)", label, emoji, note)
+            emoji_logger.info("%s (fallback=%s)", base, note)
         else:
-            emoji_logger.info("emoji['%s'] → %s (fallback)", label, emoji)
+            emoji_logger.info("%s (fallback=True)", base)
         return
     if confidence is not None:
+        base = "emoji['%s'] -> %s" % (label, emoji)
         if note:
-            emoji_logger.info(
-                "emoji['%s'] → %s (confidence=%.2f, %s)",
-                label,
-                emoji,
-                confidence,
-                note,
-            )
+            emoji_logger.info("%s (confidence=%.2f; %s)", base, confidence, note)
         else:
-            emoji_logger.info("emoji['%s'] → %s (confidence=%.2f)", label, emoji, confidence)
+            emoji_logger.info("%s (confidence=%.2f)", base, confidence)
         return
     if note:
-        emoji_logger.info("emoji['%s'] → %s (%s)", label, emoji, note)
+        emoji_logger.info("emoji['%s'] -> %s (%s)", label, emoji, note)
         return
-    emoji_logger.info("emoji['%s'] → %s", label, emoji)
+    emoji_logger.info("emoji['%s'] -> %s", label, emoji)
 
 
 def _next_neutral_emoji(exclude: str) -> str:
@@ -362,75 +559,148 @@ def _apply_repeat_protection(title: str, emoji: str) -> str:
     return emoji
 
 
-def get_emoji_by_semantics(title: str) -> EmojiDecision:
+def get_emoji_by_semantics(title: str, entity_type: str) -> EmojiDecision:
     """Запрашивает Semantic Core (LLM) для подбора эмодзи по смыслу текста."""
 
-    normalized_title = title.strip()
+    normalized_title = (title or "").strip()
     if not normalized_title:
-        _log_emoji_decision(title, DEFAULT_TASK_EMOJI, fallback=True)
-        return EmojiDecision(DEFAULT_TASK_EMOJI, 0.0, True)
+        fallback_emoji, reason = _fallback_emoji_for_entity(title, entity_type)
+        _log_emoji_decision(title or "", fallback_emoji, fallback=True, note=reason)
+        return EmojiDecision(fallback_emoji, 0.0, True)
     try:
         prompt = (
-            f"Подбери один уместный эмодзи, отражающий смысл фразы: '{normalized_title}'. Без текста, только эмодзи."
+            "Подбери один или два уместных эмодзи, отражающих смысл фразы: "
+            f"'{normalized_title}'. Без текста, только эмодзи через пробел."
         )
-        emoji = codex_query(prompt)
-        if 0 < len(emoji) <= 4:
-            confidence = _evaluate_emoji_confidence(normalized_title, emoji)
+        response = codex_query(prompt)
+        candidates = _split_candidate_emojis(response)
+        if candidates:
+            emoji_string = " ".join(candidates)
+            confidence = _evaluate_multi_emoji_confidence(normalized_title, candidates)
             if confidence >= 0.6:
-                _log_emoji_decision(normalized_title, emoji, confidence=confidence)
-                return EmojiDecision(emoji, confidence, False)
-            _log_emoji_decision(
-                normalized_title,
-                DEFAULT_TASK_EMOJI,
-                fallback=True,
-                note=f"confidence={confidence:.2f}",
-            )
-            return EmojiDecision(DEFAULT_TASK_EMOJI, confidence, True)
-        _log_emoji_decision(normalized_title, DEFAULT_TASK_EMOJI, fallback=True, note="invalid")
-    except Exception as e:
-        logging.warning(f"Emoji generation failed for '{normalized_title}': {e}")
-        _log_emoji_decision(normalized_title, DEFAULT_TASK_EMOJI, fallback=True, note="error")
-    return EmojiDecision(DEFAULT_TASK_EMOJI, 0.0, True)
+                _log_emoji_decision(normalized_title, emoji_string, confidence=confidence)
+                return EmojiDecision(emoji_string, confidence, False)
+            fallback_emoji, fallback_reason = _fallback_emoji_for_entity(normalized_title, entity_type)
+            note = f"confidence={confidence:.2f}; {fallback_reason}"
+            _log_emoji_decision(normalized_title, fallback_emoji, fallback=True, note=note)
+            return EmojiDecision(fallback_emoji, confidence, True)
+        fallback_emoji, fallback_reason = _fallback_emoji_for_entity(normalized_title, entity_type)
+        _log_emoji_decision(normalized_title, fallback_emoji, fallback=True, note=f"invalid; {fallback_reason}")
+        return EmojiDecision(fallback_emoji, 0.0, True)
+    except Exception as exc:
+        logging.warning(f"Emoji generation failed for '{normalized_title}': {exc}")
+        fallback_emoji, fallback_reason = _fallback_emoji_for_entity(normalized_title, entity_type)
+        _log_emoji_decision(normalized_title, fallback_emoji, fallback=True, note=f"error; {fallback_reason}")
+        return EmojiDecision(fallback_emoji, 0.0, True)
 
 
-def get_emoji_cached(title: str | None) -> EmojiDecision:
+def get_emoji_cached(
+    title: str | None,
+    entity_type: str,
+    *,
+    meta: dict[str, Any] | None = None,
+) -> EmojiDecision:
     key_source = (title or "").strip()
-    cache_key = key_source.lower()
+    cache_key = f"{entity_type}:{key_source.lower()}"
+    if meta:
+        stored = _extract_meta_emoji(meta)
+        if stored:
+            _EMOJI_CACHE[cache_key] = stored
+            return stored
     if cache_key in _EMOJI_CACHE:
         return _EMOJI_CACHE[cache_key]
-    decision = get_emoji_by_semantics(key_source)
+    decision = get_emoji_by_semantics(key_source, entity_type)
     _EMOJI_CACHE[cache_key] = decision
     return decision
 
 
-def _task_suffix(title: str | None) -> str:
-    decision = get_emoji_cached(title)
-    display_title = (title or "").strip()
-    emoji = _apply_repeat_protection(display_title, decision.emoji)
+def _emoji_suffix(
+    title: str | None,
+    *,
+    entity_type: str,
+    meta: dict[str, Any] | None = None,
+) -> str:
+    decision = get_emoji_cached(title, entity_type, meta=meta)
+    emoji = decision.emoji
+    if entity_type == "task":
+        display_title = (title or "").strip()
+        emoji = _apply_repeat_protection(display_title, emoji)
     return f" {emoji}" if emoji else ""
 
 
-def format_task_line(index: int, title: str, style: str = STYLE) -> str:
-    suffix = _task_suffix(title)
-    if style == "vibrant":
+def assign_list_emoji(conn, list_id: int, title: str) -> dict[str, Any]:
+    decision = get_emoji_by_semantics(title, "list")
+    meta = get_entity_meta(conn, list_id) or {}
+    meta["emoji"] = _emoji_meta_payload(decision)
+    set_entity_meta(conn, list_id, meta)
+    cache_key = f"list:{(title or '').strip().lower()}"
+    _EMOJI_CACHE[cache_key] = decision
+    return meta
+
+
+def assign_task_emoji(conn, task_id: int, title: str) -> dict[str, Any]:
+    decision = get_emoji_by_semantics(title, "task")
+    meta = get_entity_meta(conn, task_id) or {}
+    meta["emoji"] = _emoji_meta_payload(decision)
+    set_entity_meta(conn, task_id, meta)
+    cache_key = f"task:{(title or '').strip().lower()}"
+    _EMOJI_CACHE[cache_key] = decision
+    return meta
+
+
+def ensure_list_emoji(conn, user_id: int, list_name: str) -> dict[str, Any]:
+    meta = get_list_meta(conn, user_id, list_name)
+    if isinstance(meta, dict) and meta.get("emoji"):
+        return meta
+    row = find_list(conn, user_id, list_name)
+    if row and row["id"]:
+        return assign_list_emoji(conn, row["id"], row["title"])
+    return meta if isinstance(meta, dict) else {}
+
+
+def format_task_line(
+    index: int,
+    title: str,
+    *,
+    meta: dict[str, Any] | None = None,
+    style: str | None = None,
+) -> str:
+    current_style = (style or VISUAL_STYLE).upper()
+    suffix = _emoji_suffix(title, entity_type="task", meta=meta)
+    if current_style == "VIBRANT":
         accent = random.choice(VIBRANT_ACCENTS)
-        if suffix:
-            return f"{index}️⃣ {title}{suffix}{accent}"
-        return f"{index}️⃣ {title} {accent}"
+        return f"{accent} {index}️⃣ {title}{suffix}"
+    if current_style == "CHAT_FRIENDLY":
+        return f"• {title}{suffix} (#{index})"
+    if current_style == "SOFT":
+        return f"{index:02d} · {title}{suffix}"
     return f"{index}. {title}{suffix}"
 
 
-def format_task_bullet(icon: str, title: str) -> str:
-    return f"{icon} {title}{_task_suffix(title)}"
+def format_task_bullet(icon: str, title: str, *, meta: dict[str, Any] | None = None) -> str:
+    return f"{icon} {title}{_emoji_suffix(title, entity_type='task', meta=meta)}"
 
 
-def format_section_title(title: str) -> str:
-    return f"{SECTION_ICON} {title}:"
-def format_list_output(conn, user_id: int, list_name: str, heading_label: str | None = None) -> str:
-    heading = heading_label or format_section_title(list_name)
+def format_section_title(title: str, meta: dict[str, Any] | None = None) -> str:
+    return f"{SECTION_ICON} {title}{_emoji_suffix(title, entity_type='list', meta=meta)}:"
+
+
+def format_list_output(
+    conn,
+    user_id: int,
+    list_name: str,
+    heading_label: str | None = None,
+) -> str:
+    list_meta = ensure_list_emoji(conn, user_id, list_name)
+    heading = heading_label or format_section_title(list_name, list_meta)
     tasks = get_list_tasks(conn, user_id, list_name)
     if tasks:
-        lines = [format_task_line(idx, title) for idx, title in tasks]
+        lines: list[str] = []
+        for idx, title, meta, task_id in tasks:
+            task_meta = meta or {}
+            if task_id and (not task_meta or "emoji" not in task_meta):
+                task_meta = assign_task_emoji(conn, task_id, title)
+            lines.append(format_task_line(idx, title, meta=task_meta))
     else:
         lines = ["_— пусто —_"]
     return f"{heading}\n" + "\n".join(lines)
@@ -441,10 +711,11 @@ def show_all_lists(conn, user_id: int, heading_label: str | None = None) -> str:
     if not lists:
         empty_message = f"{ALL_LISTS_ICON} Пока нет списков."
         return f"{heading_label}\n_— пусто —_" if heading_label else empty_message
-    blocks = [
-        format_list_output(conn, user_id, name, heading_label=format_section_title(name))
-        for name in lists
-    ]
+    blocks = []
+    for name in lists:
+        list_meta = ensure_list_emoji(conn, user_id, name)
+        heading = format_section_title(name, list_meta)
+        blocks.append(format_list_output(conn, user_id, name, heading_label=heading))
     combined = "\n\n".join(blocks)
     if heading_label:
         return f"{heading_label}\n\n{combined}"
@@ -1103,7 +1374,7 @@ def build_semantic_state(conn, user_id: int, history: list[str] | None = None) -
         except Exception:
             logger.exception("Failed to fetch tasks for list %s while building semantic state", name)
             tasks = []
-        list_tasks[name] = [title for _, title in tasks[:10]]
+        list_tasks[name] = [title for _, title, _, _ in tasks[:10]]
     last_list = get_ctx(user_id, "last_list")
     last_action = get_ctx(user_id, "last_action")
     pending_delete = get_ctx(user_id, "pending_delete")
@@ -1176,7 +1447,11 @@ def process_task_additions(
             }
             break
         if add_result.get("created") or add_result.get("restored"):
-            results["added"].append(title_to_use)
+            task_id = add_result.get("id")
+            emoji_meta: dict[str, Any] | None = None
+            if task_id:
+                emoji_meta = assign_task_emoji(conn, task_id, title_to_use)
+            results["added"].append({"title": title_to_use, "meta": emoji_meta or {}})
         elif add_result.get("duplicate_detected"):
             results["auto_used"].append(
                 {
@@ -1192,11 +1467,15 @@ def process_task_additions(
 
 def compose_task_feedback(list_name: str, task_results: dict[str, Any]) -> list[str]:
     messages: list[str] = []
-    added = task_results.get("added") or []
-    if added:
+    added_entries = task_results.get("added") or []
+    if added_entries:
         icon = get_action_icon("add_task")
-        details = "\n".join(format_task_bullet(icon, task) for task in added)
-        if STYLE == "vibrant":
+        details = "\n".join(
+            format_task_bullet(icon, entry.get("title"), meta=entry.get("meta"))
+            for entry in added_entries
+            if entry.get("title")
+        )
+        if VISUAL_STYLE == "VIBRANT":
             header = f"{icon} Добавлено в {list_name}:"
         else:
             header = f"{icon} Добавлены задачи в {LIST_ICON} {list_name}:"
@@ -1205,12 +1484,12 @@ def compose_task_feedback(list_name: str, task_results: dict[str, Any]) -> list[
     if auto_used:
         used_titles = [f"“{item['existing']}”" for item in auto_used]
         messages.append(
-            "ℹ️ Эти задачи уже есть: "
+            "💡 Эти задачи уже есть: "
             + ", ".join(used_titles)
             + ". Использую существующие."
         )
     if (
-        not added
+        not added_entries
         and not auto_used
         and not task_results.get("duplicate")
         and task_results.get("skipped")
@@ -1316,10 +1595,17 @@ async def perform_create_list(
             )
             return False
         action_icon = get_action_icon("create")
-        if STYLE == "minimal":
-            header = f"{action_icon} Создан новый список {LIST_ICON} {list_name} ✨"
+        list_title = result.get("title") or list_name
+        list_id = result.get("id")
+        list_meta = assign_list_emoji(conn, list_id, list_title) if list_id else {}
+        list_suffix = _emoji_suffix(list_title, entity_type="list", meta=list_meta)
+        if VISUAL_STYLE in {"MINIMAL", "SOFT"}:
+            header = f"{action_icon} Создан новый список {LIST_ICON} {list_title}{list_suffix} ✨"
+        elif VISUAL_STYLE == "CHAT_FRIENDLY":
+            header = f"{action_icon} Ура! Новый список {list_title}{list_suffix} готов ✨"
         else:
-            header = f"{action_icon} Создан новый список: {list_name} ✨"
+            header = f"{action_icon} Создан новый список: {list_title}{list_suffix} ✨"
+        list_name = list_title
         task_results = process_task_additions(conn, user_id, list_name, tasks)
         message_parts = [header]
         message_parts.extend(compose_task_feedback(list_name, task_results))
@@ -1334,7 +1620,7 @@ async def perform_create_list(
         set_ctx(
             user_id,
             last_action="create_list",
-            last_list=list_name,
+            last_list=list_title,
             pending_confirmation=None,
         )
         duplicate_info = task_results.get("duplicate")
@@ -1367,7 +1653,7 @@ def map_tasks_to_lists(conn, user_id: int, task_titles: list[str]) -> dict[str, 
         return mapping
     lowered_targets = {title.lower(): title for title in task_titles}
     for list_name in get_all_lists(conn, user_id):
-        items = [t.lower() for _, t in get_list_tasks(conn, user_id, list_name)]
+        items = [title.lower() for _, title, _, _ in get_list_tasks(conn, user_id, list_name)]
         for raw_lower, original in lowered_targets.items():
             if raw_lower in items and original not in mapping:
                 mapping[original] = list_name
@@ -1838,8 +2124,13 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                         pending_delete=None,
                     )
                     continue
-                items = get_list_tasks(conn, user_id, list_name)
-                message = format_list_output(conn, user_id, list_name, heading_label=format_section_title(list_name))
+                list_meta = ensure_list_emoji(conn, user_id, list_name)
+                message = format_list_output(
+                    conn,
+                    user_id,
+                    list_name,
+                    heading_label=format_section_title(list_name, list_meta),
+                )
                 await update.message.reply_text(message, parse_mode="Markdown")
                 set_ctx(user_id, last_action="show_tasks", last_list=list_name)
             except Exception as e:
@@ -1856,10 +2147,13 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     )
                     set_ctx(user_id, last_action="show_all_tasks")
                     continue
-                blocks = [
-                    format_list_output(conn, user_id, n, heading_label=format_section_title(n))
-                    for n in lists
-                ]
+                blocks = []
+                for n in lists:
+                    list_meta = ensure_list_emoji(conn, user_id, n)
+                    heading = format_section_title(n, list_meta)
+                    blocks.append(
+                        format_list_output(conn, user_id, n, heading_label=heading)
+                    )
                 message = f"{ALL_LISTS_ICON} Все задачи:\n\n" + "\n\n".join(blocks)
                 await update.message.reply_text(message, parse_mode="Markdown")
                 set_ctx(user_id, last_action="show_all_tasks")
@@ -1874,7 +2168,9 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     lines = []
                     for list_title, task_title in tasks:
                         list_display = list_title or "Архив"
-                        lines.append(f"{list_display} — {task_title}{_task_suffix(task_title)}")
+                        lines.append(
+                            f"{list_display} — {task_title}{_emoji_suffix(task_title, entity_type='task')}"
+                        )
                     header = f"{get_action_icon('mark_done')} Завершённые задачи (последние 15):\n"
                     await update.message.reply_text(header + "\n".join(lines), parse_mode="Markdown")
                 else:
@@ -1891,7 +2187,9 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     lines = []
                     for list_title, task_title in tasks:
                         list_display = list_title or "Без списка"
-                        lines.append(f"{list_display} — {task_title}{_task_suffix(task_title)}")
+                        lines.append(
+                            f"{list_display} — {task_title}{_emoji_suffix(task_title, entity_type='task')}"
+                        )
                     header = f"{get_action_icon('delete_task')} Удалённые задачи (последние 15):\n"
                     await update.message.reply_text(header + "\n".join(lines), parse_mode="Markdown")
                 else:
@@ -1911,8 +2209,24 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                         grouped.setdefault(list_display, []).append(task_title)
                     blocks = []
                     for list_display, titles in grouped.items():
-                        heading = format_section_title(list_display)
-                        lines = [format_task_line(i, t) for i, t in enumerate(titles, start=1)]
+                        list_meta = (
+                            ensure_list_emoji(conn, user_id, list_display)
+                            if list_display and list_display != "Без списка"
+                            else {}
+                        )
+                        heading = format_section_title(list_display, list_meta)
+                        lines: list[str] = []
+                        for i, task_title in enumerate(titles, start=1):
+                            task_meta: dict[str, Any] = {}
+                            if list_display and list_display != "Без списка":
+                                task_row = fetch_task(conn, user_id, list_display, task_title)
+                                if task_row and task_row["id"]:
+                                    task_meta = assign_task_emoji(
+                                        conn, task_row["id"], task_row["title"]
+                                    )
+                            lines.append(
+                                format_task_line(i, task_title, meta=task_meta)
+                            )
                         blocks.append(f"{heading}\n" + "\n".join(lines))
                     message = f"{ALL_LISTS_ICON} Найденные задачи:\n\n" + "\n\n".join(blocks)
                     await update.message.reply_text(message, parse_mode="Markdown")
@@ -1939,12 +2253,19 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 if deleted:
                     action_icon = get_action_icon("delete_task")
                     task_name = matched or title or "задача"
-                    if STYLE == "vibrant":
-                        header = f"{action_icon} Удалено из {ln}:"
+                    list_meta = ensure_list_emoji(conn, user_id, ln)
+                    list_suffix = _emoji_suffix(ln, entity_type="list", meta=list_meta)
+                    if VISUAL_STYLE == "VIBRANT":
+                        header = f"{action_icon} Удалено из {ln}{list_suffix}:"
                     else:
-                        header = f"{action_icon} Удалено из {LIST_ICON} {ln}:"
+                        header = f"{action_icon} Удалено из {LIST_ICON} {ln}{list_suffix}:"
                     details = format_task_bullet(action_icon, task_name)
-                    list_block = format_list_output(conn, user_id, ln, heading_label=format_section_title(ln))
+                    list_block = format_list_output(
+                        conn,
+                        user_id,
+                        ln,
+                        heading_label=format_section_title(ln, list_meta),
+                    )
                     message = f"{header}\n{details}\n\n{list_block}"
                     await update.message.reply_text(message, parse_mode="Markdown")
                 else:
@@ -1960,7 +2281,11 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     logger.info(f"Deleting list: {list_name}")
                     deleted = delete_list(conn, user_id, list_name)
                     if deleted:
-                        remaining = show_all_lists(conn, user_id, heading_label=f"{ALL_LISTS_ICON} Оставшиеся списки:")
+                        remaining = show_all_lists(
+                            conn,
+                            user_id,
+                            heading_label=f"{ALL_LISTS_ICON} Оставшиеся списки:",
+                        )
                         message = f"{get_action_icon('delete_list')} Список {list_name} удалён.\n\n{remaining}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                         set_ctx(user_id, last_action="delete_list", last_list=None, pending_delete=None)
@@ -2000,12 +2325,21 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                         completed_tasks.append(matched)
                 if completed_tasks:
                     action_icon = get_action_icon("mark_done")
-                    details = "\n".join(format_task_bullet(action_icon, task) for task in completed_tasks)
-                    if STYLE == "vibrant":
-                        header = f"{action_icon} Готово в {list_name}:"
+                    details = "\n".join(
+                        format_task_bullet(action_icon, task) for task in completed_tasks
+                    )
+                    list_meta = ensure_list_emoji(conn, user_id, list_name)
+                    list_suffix = _emoji_suffix(list_name, entity_type="list", meta=list_meta)
+                    if VISUAL_STYLE == "VIBRANT":
+                        header = f"{action_icon} Готово в {list_name}{list_suffix}:"
                     else:
-                        header = f"{action_icon} Готово в {LIST_ICON} {list_name}:"
-                    list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title(list_name))
+                        header = f"{action_icon} Готово в {LIST_ICON} {list_name}{list_suffix}:"
+                    list_block = format_list_output(
+                        conn,
+                        user_id,
+                        list_name,
+                        heading_label=format_section_title(list_name, list_meta),
+                    )
                     message = f"{header}\n{details}\n\n{list_block}"
                     await update.message.reply_text(message, parse_mode="Markdown")
                     executed_actions.append("mark_done")
@@ -2016,12 +2350,19 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     deleted, matched = mark_task_done_fuzzy(conn, user_id, list_name, title)
                     if deleted:
                         action_icon = get_action_icon("mark_done")
-                        if STYLE == "vibrant":
-                            header = f"{action_icon} Готово в {list_name}:"
+                        list_meta = ensure_list_emoji(conn, user_id, list_name)
+                        list_suffix = _emoji_suffix(list_name, entity_type="list", meta=list_meta)
+                        if VISUAL_STYLE == "VIBRANT":
+                            header = f"{action_icon} Готово в {list_name}{list_suffix}:"
                         else:
-                            header = f"{action_icon} Готово в {LIST_ICON} {list_name}:"
+                            header = f"{action_icon} Готово в {LIST_ICON} {list_name}{list_suffix}:"
                         details = format_task_bullet(action_icon, matched)
-                        list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title(list_name))
+                        list_block = format_list_output(
+                            conn,
+                            user_id,
+                            list_name,
+                            heading_label=format_section_title(list_name, list_meta),
+                        )
                         message = f"{header}\n{details}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                         executed_actions.append("mark_done")
@@ -2034,10 +2375,18 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
         elif action == "rename_list" and entity_type == "list" and list_name and title:
             try:
                 logger.info(f"Renaming list: {list_name} to {title}")
+                list_row = find_list(conn, user_id, list_name)
                 renamed = rename_list(conn, user_id, list_name, title)
                 if renamed:
+                    new_meta = {}
+                    if list_row and list_row["id"]:
+                        new_meta = assign_list_emoji(conn, list_row["id"], title)
                     icon = get_action_icon("rename_list")
-                    await update.message.reply_text(f"{icon} Список {list_name} переименован в {title}.", parse_mode="Markdown")
+                    suffix = _emoji_suffix(title, entity_type="list", meta=new_meta)
+                    await update.message.reply_text(
+                        f"{icon} Список {list_name} переименован в {title}{suffix}.",
+                        parse_mode="Markdown",
+                    )
                     set_ctx(user_id, last_action="rename_list", last_list=title)
                 else:
                     await update.message.reply_text(f"⚠️ Список {list_name} не найден или {title} уже существует.")
@@ -2081,19 +2430,37 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                         )
                         if updated:
                             action_icon = get_action_icon("move_entity")
-                            target_label = (
+                            target_list_meta = ensure_list_emoji(conn, user_id, target_list_name)
+                            target_suffix = _emoji_suffix(
+                                target_list_name, entity_type="list", meta=target_list_meta
+                            )
+                            target_label_base = (
                                 target_list_name
-                                if STYLE == "vibrant"
+                                if VISUAL_STYLE == "VIBRANT"
                                 else f"{LIST_ICON} {target_list_name}"
                             )
+                            target_label = f"{target_label_base}{target_suffix}"
+                            task_row = fetch_task(conn, user_id, target_list_name, matched)
+                            task_meta: dict[str, Any] = {}
+                            task_display = matched
+                            if task_row and task_row["id"]:
+                                task_display = task_row["title"]
+                                task_meta = assign_task_emoji(
+                                    conn, task_row["id"], task_row["title"]
+                                )
+                            task_suffix = _emoji_suffix(
+                                task_display, entity_type="task", meta=task_meta
+                            )
                             header = (
-                                f"{action_icon} Перемещено: {matched} → в {target_label}{_task_suffix(matched)}"
+                                f"{action_icon} Перемещено: {task_display}{task_suffix} → в {target_label}"
                             )
                             list_block = format_list_output(
                                 conn,
                                 user_id,
                                 target_list_name,
-                                heading_label=format_section_title(target_list_name),
+                                heading_label=format_section_title(
+                                    target_list_name, target_list_meta
+                                ),
                             )
                             message = f"{header}\n\n{list_block}"
                             await update.message.reply_text(message, parse_mode="Markdown")
@@ -2114,19 +2481,37 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     )
                     if updated:
                         action_icon = get_action_icon("move_entity")
-                        target_label = (
+                        target_list_meta = ensure_list_emoji(conn, user_id, target_list_name)
+                        target_suffix = _emoji_suffix(
+                            target_list_name, entity_type="list", meta=target_list_meta
+                        )
+                        target_label_base = (
                             target_list_name
-                            if STYLE == "vibrant"
+                            if VISUAL_STYLE == "VIBRANT"
                             else f"{LIST_ICON} {target_list_name}"
                         )
+                        target_label = f"{target_label_base}{target_suffix}"
+                        task_row = fetch_task(conn, user_id, target_list_name, title)
+                        task_meta: dict[str, Any] = {}
+                        task_display = title
+                        if task_row and task_row["id"]:
+                            task_display = task_row["title"]
+                            task_meta = assign_task_emoji(
+                                conn, task_row["id"], task_row["title"]
+                            )
+                        task_suffix = _emoji_suffix(
+                            task_display, entity_type="task", meta=task_meta
+                        )
                         header = (
-                            f"{action_icon} Перемещено: {title} → в {target_label}{_task_suffix(title)}"
+                            f"{action_icon} Перемещено: {task_display}{task_suffix} → в {target_label}"
                         )
                         list_block = format_list_output(
                             conn,
                             user_id,
                             target_list_name,
-                            heading_label=format_section_title(target_list_name),
+                            heading_label=format_section_title(
+                                target_list_name, target_list_meta
+                            ),
                         )
                         message = f"{header}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
@@ -2145,12 +2530,24 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     updated, old_title = update_task_by_index(conn, user_id, list_name, meta["by_index"], meta["new_title"])
                     if updated:
                         action_icon = get_action_icon("update_task")
-                        if STYLE == "vibrant":
-                            header = f"{action_icon} Обновлено в {list_name}:"
+                        list_meta = ensure_list_emoji(conn, user_id, list_name)
+                        list_suffix = _emoji_suffix(list_name, entity_type="list", meta=list_meta)
+                        task_row = fetch_task(conn, user_id, list_name, meta["new_title"])
+                        task_meta: dict[str, Any] = {}
+                        if task_row and task_row["id"]:
+                            task_meta = assign_task_emoji(conn, task_row["id"], task_row["title"])
+                        suffix = _emoji_suffix(meta["new_title"], entity_type="task", meta=task_meta)
+                        if VISUAL_STYLE == "VIBRANT":
+                            header = f"{action_icon} Обновлено в {list_name}{list_suffix}:"
                         else:
-                            header = f"{action_icon} Обновлено в {LIST_ICON} {list_name}:"
-                        details = f"{action_icon} {old_title} → {meta['new_title']}{_task_suffix(meta['new_title'])}"
-                        list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title(list_name))
+                            header = f"{action_icon} Обновлено в {LIST_ICON} {list_name}{list_suffix}:"
+                        details = f"{action_icon} {old_title} → {meta['new_title']}{suffix}"
+                        list_block = format_list_output(
+                            conn,
+                            user_id,
+                            list_name,
+                            heading_label=format_section_title(list_name, list_meta),
+                        )
                         message = f"{header}\n{details}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                     else:
@@ -2160,12 +2557,24 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                     updated = update_task(conn, user_id, list_name, title, meta["new_title"])
                     if updated:
                         action_icon = get_action_icon("update_task")
-                        if STYLE == "vibrant":
-                            header = f"{action_icon} Обновлено в {list_name}:"
+                        list_meta = ensure_list_emoji(conn, user_id, list_name)
+                        list_suffix = _emoji_suffix(list_name, entity_type="list", meta=list_meta)
+                        task_row = fetch_task(conn, user_id, list_name, meta["new_title"])
+                        task_meta: dict[str, Any] = {}
+                        if task_row and task_row["id"]:
+                            task_meta = assign_task_emoji(conn, task_row["id"], task_row["title"])
+                        suffix = _emoji_suffix(meta["new_title"], entity_type="task", meta=task_meta)
+                        if VISUAL_STYLE == "VIBRANT":
+                            header = f"{action_icon} Обновлено в {list_name}{list_suffix}:"
                         else:
-                            header = f"{action_icon} Обновлено в {LIST_ICON} {list_name}:"
-                        details = f"{action_icon} {title} → {meta['new_title']}{_task_suffix(meta['new_title'])}"
-                        list_block = format_list_output(conn, user_id, list_name, heading_label=format_section_title(list_name))
+                            header = f"{action_icon} Обновлено в {LIST_ICON} {list_name}{list_suffix}:"
+                        details = f"{action_icon} {title} → {meta['new_title']}{suffix}"
+                        list_block = format_list_output(
+                            conn,
+                            user_id,
+                            list_name,
+                            heading_label=format_section_title(list_name, list_meta),
+                        )
                         message = f"{header}\n{details}\n\n{list_block}"
                         await update.message.reply_text(message, parse_mode="Markdown")
                     else:
@@ -2196,8 +2605,22 @@ async def route_actions(update: Update, context: ContextTypes.DEFAULT_TYPE, acti
                 if restored:
                     resolved_title = matched or title
                     icon = get_action_icon("restore_task")
+                    task_row = fetch_task(conn, user_id, list_name, resolved_title)
+                    task_meta: dict[str, Any] = {}
+                    if task_row and task_row["id"]:
+                        resolved_title = task_row["title"]
+                        task_meta = assign_task_emoji(
+                            conn, task_row["id"], task_row["title"]
+                        )
+                    task_suffix = _emoji_suffix(
+                        resolved_title, entity_type="task", meta=task_meta
+                    )
+                    list_meta = ensure_list_emoji(conn, user_id, list_name)
+                    list_suffix = _emoji_suffix(
+                        list_name, entity_type="list", meta=list_meta
+                    )
                     await update.message.reply_text(
-                        f"{icon} Задача {resolved_title} восстановлена в списке {list_name}.",
+                        f"{icon} Задача {resolved_title}{task_suffix} восстановлена в списке {list_name}{list_suffix}.",
                         parse_mode="Markdown",
                     )
                 elif suggestion:

@@ -373,6 +373,54 @@ def _dump_meta(meta: dict[str, Any] | None) -> str | None:
     return json.dumps(meta, ensure_ascii=False)
 
 
+def get_entity_meta(conn: sqlite3.Connection, entity_id: int) -> dict[str, Any]:
+    try:
+        cur = conn.execute(
+            "SELECT meta FROM entities WHERE id = ? LIMIT 1",
+            (entity_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {}
+        return _load_meta(row["meta"] if isinstance(row, sqlite3.Row) else row[0])
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in get_entity_meta: %s", exc)
+        return {}
+
+
+def set_entity_meta(
+    conn: sqlite3.Connection, entity_id: int, meta: dict[str, Any] | None
+) -> None:
+    try:
+        conn.execute(
+            "UPDATE entities SET meta = ? WHERE id = ?",
+            (_dump_meta(meta), entity_id),
+        )
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in set_entity_meta: %s", exc)
+
+
+def get_list_meta(conn: sqlite3.Connection, user_id: int, list_name: str) -> dict[str, Any]:
+    try:
+        cur = conn.execute(
+            """
+            SELECT meta
+            FROM entities
+            WHERE user_id = ? AND type = 'list' AND LOWER(title) = LOWER(?)
+              AND (json_extract(meta, '$.deleted') IS NULL OR json_extract(meta, '$.deleted') IS NOT TRUE)
+            LIMIT 1
+            """,
+            (user_id, list_name),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {}
+        return _load_meta(row["meta"] if isinstance(row, sqlite3.Row) else row[0])
+    except sqlite3.Error as exc:
+        logging.error("SQLite error in get_list_meta: %s", exc)
+        return {}
+
+
 def _get_list_id(conn: sqlite3.Connection, user_id: int, list_name: str) -> int | None:
     cur = conn.execute(
         """
@@ -594,7 +642,7 @@ def find_list(conn: sqlite3.Connection, user_id: int, list_name: str) -> sqlite3
     try:
         cur = conn.execute(
             """
-            SELECT id, title
+            SELECT id, title, meta
             FROM entities
             WHERE user_id = ? AND type = 'list' AND LOWER(title) = LOWER(?)
             LIMIT 1
@@ -799,13 +847,18 @@ def update_task_by_index(
         logging.error("SQLite error in update_task_by_index: %s", exc)
         return 0, None
 
-def get_list_tasks(conn: sqlite3.Connection, user_id: int, list_name: str) -> list[tuple[int, str]]:
+def get_list_tasks(
+    conn: sqlite3.Connection, user_id: int, list_name: str
+) -> list[tuple[int, str, dict[str, Any], int]]:
     try:
         list_id = _get_list_id(conn, user_id, list_name)
         if list_id is None:
             return []
         tasks = _list_active_tasks(conn, user_id, list_id)
-        results = [(idx + 1, row["title"]) for idx, row in enumerate(tasks)]
+        results = [
+            (idx + 1, row["title"], _load_meta(row["meta"]), row["id"])
+            for idx, row in enumerate(tasks)
+        ]
         logging.info("Retrieved %s tasks for list '%s' for user %s", len(results), list_name, user_id)
         return results
     except sqlite3.Error as exc:
